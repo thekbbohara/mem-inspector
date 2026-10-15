@@ -198,7 +198,11 @@ fn system_items(home: &Path) -> Vec<Item> {
 pub fn gather(space: &Space, overview: &Value) -> Facts {
     let mut facts = Facts {
         home: space.home.to_string_lossy().into(),
-        archive: space.archive.to_string_lossy().into(),
+        archive: space
+            .archive
+            .as_ref()
+            .map(|a| a.to_string_lossy().into())
+            .unwrap_or_default(),
         scanned_at: overview["scannedAt"].as_i64().unwrap_or(0),
         disks: disks(overview),
         ..Default::default()
@@ -250,7 +254,14 @@ pub fn gather(space: &Space, overview: &Value) -> Facts {
     }
     let paths: Vec<PathBuf> = targets.iter().map(|t| t.0.clone()).collect();
     let (sizes, places, system) = std::thread::scope(|s| {
-        let cold = s.spawn(|| placement::find(space, overview));
+        // Without an archive folder there is nowhere to move to: no move facts.
+        let cold = s.spawn(|| {
+            if space.archive.is_some() {
+                placement::find(space, overview)
+            } else {
+                Vec::new()
+            }
+        });
         let system = s.spawn(|| system_items(&space.home));
         (
             freeable_each(&paths),
@@ -622,7 +633,7 @@ mod tests {
     fn gather_finds_caches_idle_deps_and_cold_files_on_fake_home() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
-        let space = Space::new(home.clone(), dir.path().join("archive")).unwrap();
+        let space = Space::new(home.clone(), Some(dir.path().join("archive"))).unwrap();
         let big = |p: &Path, n: usize| {
             fs::create_dir_all(p.parent().unwrap()).unwrap();
             fs::write(p, vec![1u8; n]).unwrap();

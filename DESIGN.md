@@ -85,9 +85,9 @@ only on the dialog and popover (one soft ambient layer), never on cards.
 
 - **Disk card**: name (13px/600), medium line "SSD - fast" or "HDD - slow,
   roomy" (11px text-3, Zap or HardDrive icon), free space right (14px/600
-  tabular) with "of 500 GB" under it. Bar 8px, radius 4, segments in type
+  tabular) with "of 476 GB" under it. Bar 8px, radius 4, segments in type
   order with a 2px surface gap, free as the track. Hover on a segment shows
-  "Deps - 40 GB". While a disk's types are still being measured the used part
+  "Deps - 111 GB". While a disk's types are still being measured the used part
   is one neutral fill with a slow shimmer; free space is always exact.
 - **Legend**: one row under the disks, an 8px swatch and label per type that
   exists on any disk. Hover on a legend item dims every other type on every
@@ -104,7 +104,7 @@ only on the dialog and popover (one soft ambient layer), never on cards.
   is never run: the card says "Needs root. Run it in your own terminal" and
   its button is a quiet Root button (lock icon) that copies the line.
 - **Placement card**: same frame. Line 2 is the route: "SSD -> HDD" then the
-  mono target folder ("/mnt/data2/archive/home/alex/work", middle-truncated).
+  mono target folder ("/media/disk/Archive/home/you/work", middle-truncated).
   Line 3 is the tradeoff in text-3 ("Loads slower; fine for footage you rarely
   open"). The button says Move. Under the placement cards, one muted tip says
   what stays on the SSD and why.
@@ -119,13 +119,23 @@ only on the dialog and popover (one soft ambient layer), never on cards.
   of scrollback, read-only. Output stays until the owner closes it.
 - **Header**: logo and name left; right side "Scanned 3 min ago", a visible
   Rescan button (RotateCw, spins while scanning) and the gear. The gear keeps
-  engine, model and moves to undo.
+  engine, model, the folder personal files go to (Change / Turn off) and
+  moves to undo.
+- **First run**: a narrow dialog over the app, not dismissable by Escape. Three
+  lines (Clean, Move, You decide) with accent icons, then "Where should
+  personal files go?" with the path field and a Choose folder button (native
+  folder picker). Errors (same disk as home, not writable) show in --bad under
+  the field. Footer: ghost "Skip, cleanup only" left, primary Continue right
+  (enabled once a folder is saved). Without Claude Code, one quiet line says
+  built-in rules rank the cleanup.
+- **Moves off**: with no folder, the HDD lane shows one dashed box "Moving is
+  off" with a Choose folder button instead of placement cards.
 - **Logo**: "Link Back". A hollow rounded square (the slot that stays on the
   SSD, #eae7e2) joined by one bent link to a solid rounded square (the data
   now on the HDD, accent #e8793a). It is the app's own trick, the symlink,
   drawn left to right like the lanes. Header uses the small cut at 20px; app
   icons come from a 1024px tile (#111114, radius 22%) via `tauri icon`.
-  Sources: the icons in `src-tauri/icons/`.
+  Source tile: `src-tauri/icons/icon.png`.
 - **Icons**: Lucide at 16px, 1.5 stroke; 14px inside type tiles.
 
 ## Motion
@@ -172,7 +182,7 @@ roomy HDD. Links keep every path working." Cards, biggest first, one per
 group: large videos and media, Downloads older than 30 days, idle git projects
 (no commits or edits in 60+ days), AI models not loaded in 14+ days, Android
 system images, archives, backups and disk images, big files untouched 90+
-days. Each card: what, size, "SSD -> HDD (/mnt/data2/archive/...)", one-line
+days. Each card: what, size, "SSD -> HDD (<archive folder>/...)", one-line
 tradeoff. Moves copy, compare file count and bytes, park the original, link
 back, and can be undone. Never offered: dotfiles and config, tracked files or
 git data of repos, active projects, anything open in a running app, anything
@@ -184,12 +194,12 @@ daily. They need fast random reads."
 
 Header (logo, scanned label, Rescan, gear), then two lanes, then the chat dock.
 
-- **SSD lane (left, 1.25fr)**: "SYSTEM SSD fast - 500 GB"; the free space as
+- **SSD lane (left, 1.25fr)**: "SYSTEM SSD fast - 476 GB"; the free space as
   the one hero number (28px/600, counts up after actions) with "80% full" or
   "+18 GB this session" under it and the top three data types to the right;
   the 14px type-split bar; the legend; the latest result banner; then "FREE UP
   SPACE" with the cleanup and command cards.
-- **HDD lane (right, 1fr, #0c0c0f)**: "HDD slow, roomy - 800 GB free"; one
+- **HDD lane (right, 1fr, #0c0c0f)**: "HDD slow, roomy - 779 GB free"; one
   compact card per other disk with its bar; then "BELONGS ON THE HDD" with the
   placement cards (dashed border, "on SSD now" tag, arrow to the HDD folder,
   tradeoff, Move ->) and the keep-on-SSD tip.
@@ -198,9 +208,8 @@ Header (logo, scanned label, Rescan, gear), then two lanes, then the chat dock.
   it belongs to.
 - **Terminal**: when a command runs, the panel opens between lanes and dock.
 
-Other concepts considered:
-A, a refined single column, and
-B, a storage map with a side pane.
+Other concepts considered: A, a refined single column, and B, a storage map
+with a side pane.
 
 ## Responsive
 

@@ -31,7 +31,7 @@ export type Plan = {
   id: string;
   action: Action;
   rows: Row[];
-  target: string;
+  target: string | null;
   command?: string | null;
 };
 export type Outcome = {
@@ -62,6 +62,13 @@ export type TermChunk = {
   line: string;
 };
 type DiskState = { disks: Disk[]; undo: Undo[] };
+export type AppSettings = {
+  /** Folder on a second disk for personal files; null means moves are off. */
+  archive: string | null;
+  setupDone: boolean;
+  home: string;
+  claude: { installed: boolean; dir: string; configured: boolean };
+};
 
 const call = <T>(request: Record<string, unknown>) =>
   requestNative(request as never) as Promise<T>;
@@ -72,6 +79,12 @@ const engine = (e: Engine) => ({
 });
 
 export const api = {
+  settings: () => call<AppSettings>({ action: "settings" }),
+  /** Native folder picker; null when cancelled. */
+  pick: () => call<{ path: string | null }>({ action: "pick" }),
+  /** Checks and saves the folder; null turns moves off. */
+  setArchive: (path: string | null) =>
+    call<AppSettings>({ action: "setarchive", path }),
   overview: (fresh = false) =>
     call<Overview>({
       action: "overview",
@@ -79,7 +92,11 @@ export const api = {
     }),
   disks: () =>
     call<
-      DiskState & { home: string; archive: string; scannedAt: number | null }
+      DiskState & {
+        home: string;
+        archive: string | null;
+        scannedAt: number | null;
+      }
     >({ action: "disks" }),
   suggest: (e: Engine) =>
     call<{
@@ -89,7 +106,12 @@ export const api = {
       home: string;
     }>({ action: "suggest", ...engine(e) }),
   placement: () =>
-    call<{ cards: Card[]; keep: string; archive: string; home: string }>({
+    call<{
+      cards: Card[];
+      keep: string;
+      archive: string | null;
+      home: string;
+    }>({
       action: "placement",
     }),
   recheck: () =>

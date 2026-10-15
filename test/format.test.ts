@@ -73,14 +73,14 @@ test("disk segments keep free space and fixed type order", () => {
   assert.deepEqual(segments(null, 1, 1), []);
 });
 test("HDD targets keep the archive root and the end", () => {
-  const a = "/mnt/data2/archive";
+  const a = "/media/disk/Archive";
   assert.equal(
-    hddPath("/mnt/data2/archive/home/alex/work/clips", a),
-    "/mnt/data2/archive/…/work/clips",
+    hddPath("/media/disk/Archive/home/alex/work/clips", a),
+    "/media/disk/Archive/…/work/clips",
   );
   assert.equal(
-    hddPath("/mnt/data2/archive/home/al", a),
-    "/mnt/data2/archive/home/al",
+    hddPath("/media/disk/Archive/home/al", a),
+    "/media/disk/Archive/home/al",
   );
   assert.equal(hddPath("/elsewhere/x", a), "/elsewhere/x");
 });

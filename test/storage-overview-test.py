@@ -30,7 +30,7 @@ class StorageTests(unittest.TestCase):
             self.assertFalse(any(r['path'].startswith(str(home / 'external')) for r in result['folders']))
             self.assertEqual(external.stat().st_size, 4 * 1024 * 1024)
     def test_personal_state_never_reclaim_candidate(self):
-        for name in ['Documents/report', '.codex/history', '.jarvis/worktrees/project', '.local/share/models']:
+        for name in ['Documents/report', '.codex/history', '.agent/worktrees/project', '.local/share/models']:
             self.assertEqual(storage.classify('/home/test/' + name, '/home/test')[1], 'Keep')
     def test_kinds_repos_big_files_and_downloads(self):
         with tempfile.TemporaryDirectory() as root:

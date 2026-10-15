@@ -83,15 +83,7 @@ impl Queue {
             ));
         }
         let mut protected: Vec<PathBuf> = [
-            "/etc",
-            "/usr",
-            "/var",
-            "/boot",
-            "/proc",
-            "/sys",
-            "/dev",
-            "/run",
-            "/opt",
+            "/etc", "/usr", "/var", "/boot", "/proc", "/sys", "/dev", "/run", "/opt",
         ]
         .iter()
         .map(PathBuf::from)

@@ -471,6 +471,22 @@ button:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.target svg {
+  flex: none;
+}
+/* Ellipsis at the start: right-to-left box, left-to-right text inside. */
+.tail {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+}
+.tail bdi {
+  direction: ltr;
+  unicode-bidi: isolate;
+}
 .cmd {
   display: inline-block;
   max-width: 100%;
@@ -1077,6 +1093,116 @@ input[type="checkbox"]:checked::after {
 .segmented button.on {
   background: var(--surface-2);
   color: var(--text);
+}
+.folder {
+  font-size: 12px;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.empty-path {
+  color: var(--text-3);
+  font-size: 12.5px;
+}
+.field-actions {
+  display: flex;
+  gap: 6px;
+}
+
+/* First run */
+.welcome .ways {
+  list-style: none;
+  margin: 0;
+  padding: 0 20px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.welcome .ways li {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-2);
+}
+.welcome .ways svg {
+  flex: none;
+  margin-top: 2px;
+  color: var(--accent);
+}
+.welcome .ways b {
+  color: var(--text);
+  font-weight: 600;
+}
+.pick {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px 20px;
+  border-top: 1px solid var(--line);
+}
+.pick-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.pick-path {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  font-size: 12.5px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.pick-help,
+.claude-note {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-3);
+}
+.claude-note {
+  padding: 0 20px 16px;
+}
+.pick-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--bad);
+}
+.pick-error svg {
+  flex: none;
+  margin-top: 2px;
+}
+.moves-off {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 20px;
+  padding: 16px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 10px;
+}
+.moves-off b {
+  font-size: 13px;
+  font-weight: 600;
+}
+.moves-off p {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
 }
 
 /* Narrow windows: lanes stack, SSD first. */

@@ -1,7 +1,16 @@
 import { useEffect, useRef, useState } from "react";
-import { Play, Undo2, X } from "lucide-react";
+import {
+  CircleAlert,
+  FolderOpen,
+  HardDrive,
+  Play,
+  ShieldCheck,
+  Sparkles,
+  Undo2,
+  X,
+} from "lucide-react";
 import { api } from "./api";
-import type { Card, Engine, Plan, Undo } from "./api";
+import type { AppSettings, Card, Engine, Plan, Undo } from "./api";
 import { middle, selectedBytes, size, tilde } from "./format";
 import { Spinner } from "./ui";
 
@@ -89,7 +98,7 @@ export function Preview({
             <h2 id="dlg-title">{card.issue}</h2>
             <p className="quiet">
               {move
-                ? `SSD to HDD (${middle(card.target ?? plan.target, 48)}). Copied, checked, linked back. Undo anytime.`
+                ? `SSD to HDD (${middle(card.target ?? plan.target ?? "", 48)}). Copied, checked, linked back. Undo anytime.`
                 : "Deleted for real, not moved to Trash."}
             </p>
           </div>
@@ -254,19 +263,178 @@ export function ConfirmRun({
   );
 }
 
+const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+/** Native folder picker, then the backend checks and saves the choice. */
+export function useArchivePicker(onSaved: (s: AppSettings) => void) {
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const save = async (pick: () => Promise<string | null | undefined>) => {
+    setError(null);
+    setBusy(true);
+    try {
+      const path = await pick();
+      if (path !== undefined) onSaved(await api.setArchive(path));
+      return true;
+    } catch (e) {
+      setError(errorText(e));
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  };
+  return {
+    error,
+    busy,
+    // A cancelled picker changes nothing.
+    choose: () => save(async () => (await api.pick()).path ?? undefined),
+    off: () => save(async () => null),
+  };
+}
+
+function PickError({ text }: { text: string | null }) {
+  if (!text) return null;
+  return (
+    <p className="pick-error" role="alert">
+      <CircleAlert size={13} strokeWidth={1.75} />
+      {text}
+    </p>
+  );
+}
+
+/** First launch: what the app does, the safety rules, and where moves go. */
+export function FirstRun({
+  settings,
+  onSaved,
+  onDone,
+}: {
+  settings: AppSettings;
+  onSaved: (s: AppSettings) => void;
+  onDone: () => void;
+}) {
+  const { choose, off, error, busy } = useArchivePicker(onSaved);
+  const chosen = settings.archive;
+  return (
+    <Scrim onClose={() => undefined} blocked>
+      <div
+        className="dialog narrow welcome"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="welcome-title"
+      >
+        <header>
+          <div>
+            <h2 id="welcome-title">Welcome to Mem Inspector</h2>
+            <p className="quiet">
+              It shows what fills your disk and frees space two ways.
+            </p>
+          </div>
+        </header>
+        <ul className="ways">
+          <li>
+            <Sparkles size={15} strokeWidth={1.75} />
+            <span>
+              <b>Clean</b> caches and old build folders that rebuild themselves.
+            </span>
+          </li>
+          <li>
+            <HardDrive size={15} strokeWidth={1.75} />
+            <span>
+              <b>Move</b> big personal files, like videos and old projects, to a
+              second disk. A link stays behind, so every path still works.
+            </span>
+          </li>
+          <li>
+            <ShieldCheck size={15} strokeWidth={1.75} />
+            <span>
+              <b>You decide.</b> You see every file before anything happens.
+              Personal files are moved, never deleted.
+            </span>
+          </li>
+        </ul>
+        <div className="pick">
+          <span className="label">Where should personal files go?</span>
+          <div className="pick-row">
+            <span
+              className={chosen ? "pick-path mono" : "pick-path empty-path"}
+              title={chosen ?? undefined}
+            >
+              {chosen ? middle(chosen, 46) : "A folder on a second disk"}
+            </span>
+            <button className="btn solid" onClick={choose} disabled={busy}>
+              {busy ? <Spinner /> : <FolderOpen size={14} strokeWidth={1.75} />}
+              {chosen ? "Change" : "Choose folder"}
+            </button>
+          </div>
+          <PickError text={error} />
+          <p className="pick-help">
+            No second disk? Skip this. Cleanup works without it, and you can
+            pick a folder later in Settings.
+          </p>
+        </div>
+        {!settings.claude.installed && (
+          <p className="claude-note">
+            Claude Code is not installed, so built-in rules rank the cleanup.
+            Install it any time for smarter picks.
+          </p>
+        )}
+        <footer>
+          <button
+            className="btn ghost"
+            disabled={busy}
+            onClick={async () => {
+              await off();
+              onDone();
+            }}
+          >
+            Skip, cleanup only
+          </button>
+          <button className="btn primary" disabled={!chosen} onClick={onDone}>
+            Continue
+          </button>
+        </footer>
+      </div>
+    </Scrim>
+  );
+}
+
+/** HDD lane without a folder: moves are off, cleanup still works. */
+export function MovesOff({ onSaved }: { onSaved: (s: AppSettings) => void }) {
+  const { choose, error, busy } = useArchivePicker(onSaved);
+  return (
+    <div className="moves-off">
+      <b>Moving is off</b>
+      <p className="quiet">
+        Pick a folder on a second disk to move big personal files there. Cleanup
+        works without it.
+      </p>
+      <button className="btn solid" onClick={choose} disabled={busy}>
+        {busy ? <Spinner /> : <FolderOpen size={14} strokeWidth={1.75} />}
+        Choose folder
+      </button>
+      <PickError text={error} />
+    </div>
+  );
+}
+
 export function Settings({
   engine,
   setEngine,
+  archive,
+  onSaved,
   undo,
   onUndo,
   onClose,
 }: {
   engine: Engine;
   setEngine: (e: Engine) => void;
+  archive: string | null;
+  onSaved: (s: AppSettings) => void;
   undo: Undo[];
   onUndo: (id: string) => void;
   onClose: () => void;
 }) {
+  const picker = useArchivePicker(onSaved);
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const away = (e: MouseEvent) =>
@@ -307,6 +475,35 @@ export function Settings({
           }
         />
       </label>
+      <div className="field">
+        <span className="label">Personal files go to</span>
+        <span
+          className={archive ? "folder mono" : "folder empty-path"}
+          title={archive ?? undefined}
+        >
+          {archive ? middle(archive, 34) : "No folder, moving is off"}
+        </span>
+        <div className="field-actions">
+          <button
+            className="btn ghost"
+            onClick={picker.choose}
+            disabled={picker.busy}
+          >
+            <FolderOpen size={14} strokeWidth={1.75} />
+            {archive ? "Change" : "Choose folder"}
+          </button>
+          {archive && (
+            <button
+              className="btn ghost"
+              onClick={picker.off}
+              disabled={picker.busy}
+            >
+              Turn off
+            </button>
+          )}
+        </div>
+        <PickError text={picker.error} />
+      </div>
       {undo.length > 0 && (
         <div className="field">
           <span className="label">On the HDD</span>

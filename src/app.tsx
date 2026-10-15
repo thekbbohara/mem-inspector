@@ -16,6 +16,7 @@ import "@fontsource-variable/inter";
 import "./app.css";
 import { api } from "./api";
 import type {
+  AppSettings,
   Card,
   Disk,
   Engine,
@@ -28,7 +29,7 @@ import type {
 import { ago, clock, hddPath, middle, size, tilde, usedRatio } from "./format";
 import { present, segments } from "./kinds";
 import { Bar, CountSize, Legend, Spinner, Tile, useCountUp } from "./ui";
-import { ConfirmRun, Preview, Settings } from "./dialogs";
+import { ConfirmRun, FirstRun, MovesOff, Preview, Settings } from "./dialogs";
 import { TerminalPanel, terminalSize } from "./terminal";
 import type { RunState } from "./terminal";
 
@@ -47,6 +48,15 @@ type Busy = { label: string; since: number } | null;
 
 const ENGINE_KEY = "mem-inspector.engine";
 const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+/** A path that, when too long, loses its start ("…") and keeps the folder name. */
+function TailPath({ path }: { path: string }) {
+  return (
+    <span className="tail">
+      <bdi>{path}</bdi>
+    </span>
+  );
+}
 
 function loadEngine(): Engine {
   try {
@@ -129,7 +139,9 @@ function CardView({
         <div className="main">
           <p className="issue">{card.issue}</p>
           {card.action === "move" && state === "done" && card.target && (
-            <p className="target mono">{hddPath(card.target, archive)}</p>
+            <p className="target mono" title={card.target}>
+              <TailPath path={hddPath(card.target, archive)} />
+            </p>
           )}
         </div>
         <span className="resolved-right">
@@ -169,7 +181,7 @@ function CardView({
           <>
             <p className="target mono" title={card.target}>
               <ArrowRight size={11} strokeWidth={2} />
-              {hddPath(card.target ?? "", archive)}
+              <TailPath path={hddPath(card.target ?? "", archive)} />
             </p>
             <p className="trade">{card.tradeoff ?? card.fix}</p>
           </>
@@ -361,6 +373,10 @@ function App() {
   const [gained, setGained] = useState(0);
   const [focus, setFocus] = useState<string | null>(null);
   const [glow, setGlow] = useState(false);
+  const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [welcome, setWelcome] = useState(false);
+  // Read inside the memoized scan; settings arrive long before suggestions.
+  const noClaudeRef = useRef(false);
   const run = useRef(0);
   const resultKey = useRef(0);
 
@@ -377,7 +393,7 @@ function App() {
     const d = await api.disks();
     setDisks(d.disks);
     setHome(d.home);
-    setArchive(d.archive);
+    setArchive(d.archive ?? "");
     setUndo(d.undo);
     setScannedAt(d.scannedAt ? d.scannedAt * 1000 : null);
     return d.disks;
@@ -426,7 +442,11 @@ function App() {
           setHome(s.home);
           setCleanup(s.suggestions.map((card) => ({ card, state: "open" })));
           if (s.source === "rules")
-            setNote("AI is unavailable, so these come from built-in rules.");
+            setNote(
+              noClaudeRef.current
+                ? "Claude Code is not installed, so built-in rules picked these."
+                : "AI is unavailable, so these come from built-in rules.",
+            );
           else if (s.source !== "claude")
             setNote(`Claude is unavailable, ${s.source} answered.`);
         });
@@ -457,6 +477,39 @@ function App() {
   useEffect(() => {
     start(false);
   }, [start]);
+
+  useEffect(() => {
+    api
+      .settings()
+      .then((s) => {
+        setSettings(s);
+        noClaudeRef.current = !s.claude.installed;
+        setWelcome(!s.setupDone);
+      })
+      .catch((e) => setNote(errorText(e)));
+  }, []);
+
+  /** A new archive folder: move cards are rebuilt for it, if a scan is done. */
+  const archiveSaved = (s: AppSettings) => {
+    setSettings(s);
+    setArchive(s.archive ?? "");
+    if (scan || busy) return;
+    const token = run.current;
+    setPlacement(null);
+    api
+      .placement()
+      .then((p) => {
+        if (token !== run.current) return;
+        setKeep(p.keep);
+        setPlacement(p.cards.map((card) => ({ card, state: "open" })));
+      })
+      .catch((e) => {
+        setPlacement([]);
+        setNote(errorText(e));
+      });
+  };
+  const noClaude = settings?.claude.installed === false;
+  const movesOff = settings !== null && !settings.archive;
 
   // Clock for "scanned X ago" and the scan timer.
   useEffect(() => {
@@ -721,6 +774,8 @@ function App() {
               <Settings
                 engine={engine}
                 setEngine={setEngine}
+                archive={settings?.archive ?? null}
+                onSaved={archiveSaved}
                 undo={undo}
                 onUndo={(u) => {
                   setGear(false);
@@ -809,7 +864,14 @@ function App() {
                 </span>
               </div>
               {cleanup === null ? (
-                <Skeleton n={3} label="Claude is ranking the biggest wins" />
+                <Skeleton
+                  n={3}
+                  label={
+                    noClaude
+                      ? "Finding the biggest wins"
+                      : "Claude is ranking the biggest wins"
+                  }
+                />
               ) : (
                 cleanup.map((s, i) => (
                   <CardView
@@ -853,41 +915,45 @@ function App() {
               <Bar disk={d} focus={focus} />
             </div>
           ))}
-          {!scan && (
-            <>
-              <div className="sub">
-                BELONGS ON THE HDD
-                <span>Moved with a link back, undoable</span>
-              </div>
-              {placement === null ? (
-                <Skeleton n={2} label="Looking for data that belongs here" />
-              ) : placement.length === 0 ? (
-                <p className="hint">Everything is on the right disk.</p>
-              ) : (
-                placement.map((s, i) => (
-                  <CardView
-                    key={s.card.id}
-                    slot={s}
-                    home={home}
-                    archive={archive}
-                    index={i}
-                    primary={s.card.id === firstOpen(placement)}
-                    loading={planning === s.card.id}
-                    onDo={() => open(s)}
-                    onSkip={() => patch(s.card.id, { state: "skipped" })}
-                    onUndo={() =>
-                      s.outcome?.undo && undoMove(s.outcome.undo, s.card.id)
-                    }
-                  />
-                ))
-              )}
-              {keep && (
-                <p className="keep">
-                  <Zap size={13} strokeWidth={1.75} />
-                  {keep}
-                </p>
-              )}
-            </>
+          {movesOff ? (
+            <MovesOff onSaved={archiveSaved} />
+          ) : (
+            !scan && (
+              <>
+                <div className="sub">
+                  BELONGS ON THE HDD
+                  <span>Moved with a link back, undoable</span>
+                </div>
+                {placement === null ? (
+                  <Skeleton n={2} label="Looking for data that belongs here" />
+                ) : placement.length === 0 ? (
+                  <p className="hint">Everything is on the right disk.</p>
+                ) : (
+                  placement.map((s, i) => (
+                    <CardView
+                      key={s.card.id}
+                      slot={s}
+                      home={home}
+                      archive={archive}
+                      index={i}
+                      primary={s.card.id === firstOpen(placement)}
+                      loading={planning === s.card.id}
+                      onDo={() => open(s)}
+                      onSkip={() => patch(s.card.id, { state: "skipped" })}
+                      onUndo={() =>
+                        s.outcome?.undo && undoMove(s.outcome.undo, s.card.id)
+                      }
+                    />
+                  ))
+                )}
+                {keep && (
+                  <p className="keep">
+                    <Zap size={13} strokeWidth={1.75} />
+                    {keep}
+                  </p>
+                )}
+              </>
+            )
           )}
         </section>
       </div>
@@ -946,6 +1012,13 @@ function App() {
           home={home}
           onClose={() => setPreview(null)}
           onConfirm={confirm}
+        />
+      )}
+      {welcome && settings && (
+        <FirstRun
+          settings={settings}
+          onSaved={archiveSaved}
+          onDone={() => setWelcome(false)}
         />
       )}
       {confirmRun && (

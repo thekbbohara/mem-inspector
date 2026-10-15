@@ -1,4 +1,5 @@
 use crate::advisor::{self, Facts, Suggestion};
+use crate::hostenv::HostEnv;
 use crate::placement;
 use crate::space::{self, Kind as Action2, Space};
 use crate::tools;
@@ -8,7 +9,7 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
 };
 
 #[derive(Debug, Deserialize)]
@@ -40,6 +41,9 @@ pub enum Action {
     Exec,
     Term,
     Stop,
+    Settings,
+    SetArchive,
+    Pick,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -70,7 +74,8 @@ struct Inner {
     fixture: Option<(PathBuf, PathBuf)>,
     overview: Mutex<Option<Value>>,
     overview_running: Mutex<bool>,
-    space: Option<Space>,
+    /// Replaced when the user picks another archive folder.
+    space: RwLock<Option<Space>>,
     facts: Mutex<Option<Facts>>,
     gathering: Mutex<()>,
     cards: Mutex<Vec<Suggestion>>,
@@ -174,7 +179,7 @@ impl Bridge {
                 fixture,
                 overview: Mutex::new(None),
                 overview_running: Mutex::new(false),
-                space,
+                space: RwLock::new(space),
                 facts: Mutex::new(None),
                 gathering: Mutex::new(()),
                 cards: Mutex::new(Vec::new()),
@@ -205,9 +210,8 @@ impl Bridge {
             let root = self
                 .fixture_root()
                 .or_else(|| {
-                    self.inner
-                        .space
-                        .as_ref()
+                    self.space()
+                        .ok()
                         .map(|s| s.home.to_string_lossy().into_owned())
                 })
                 .ok_or("Home directory unavailable")?;
@@ -220,6 +224,7 @@ impl Bridge {
                     use std::io::{BufRead, BufReader};
                     let job = (|| -> Result<(), String> {
                         let mut child = std::process::Command::new("python3")
+                            .host_env()
                             .arg("-c")
                             .arg(include_str!("../../scripts/storage-overview.py"))
                             .arg(root)
@@ -281,6 +286,12 @@ impl Bridge {
                 | Action::Stop
         ) {
             return self.simple(r);
+        }
+        if matches!(r.action, Action::Settings) {
+            return self.settings_view();
+        }
+        if matches!(r.action, Action::SetArchive) {
+            return self.set_archive(r.path.as_deref());
         }
         if matches!(r.action, Action::Status) {
             return Ok(json!({"root":self.fixture_root(),"fixture":self.inner.fixture.is_some()}));
@@ -509,18 +520,68 @@ impl Bridge {
                 };
                 Ok(json!({"history":Self::history(&data)?}))
             }
-            Action::Status | Action::Choose | Action::Cancel | Action::History => {
-                Err("Unsupported dispatch".into())
-            }
+            Action::Status
+            | Action::Choose
+            | Action::Cancel
+            | Action::History
+            | Action::Settings
+            | Action::SetArchive
+            | Action::Pick => Err("Unsupported dispatch".into()),
         }
     }
 }
 impl Bridge {
-    fn space(&self) -> Result<&Space, String> {
+    fn space(&self) -> Result<Space, String> {
         self.inner
             .space
-            .as_ref()
-            .ok_or_else(|| "Home or archive configuration invalid".into())
+            .read()
+            .map_err(|_| "Internal state unavailable".to_string())?
+            .clone()
+            .ok_or_else(|| "Home directory unavailable".into())
+    }
+    /// First-run state, the archive folder and whether Claude Code is set up.
+    fn settings_view(&self) -> Result<Value, String> {
+        let space = self.space()?;
+        let saved = crate::settings::Settings::load();
+        let forced = std::env::var_os("MEM_INSPECTOR_ARCHIVE").is_some();
+        let claude = crate::settings::claude_dir();
+        Ok(json!({
+            "archive": space.archive,
+            "setupDone": saved.setup_done || forced || self.inner.fixture.is_some(),
+            "home": space.home,
+            "claude": {
+                "installed": crate::settings::on_path("claude"),
+                "dir": claude,
+                "configured": claude.is_dir(),
+            },
+        }))
+    }
+    /// Save the folder for personal files, or None for cleanup only. The
+    /// folder is checked first; facts and move cards are rebuilt for it.
+    fn set_archive(&self, path: Option<&str>) -> Result<Value, String> {
+        let space = self.space()?;
+        let archive = match path.map(str::trim).filter(|p| !p.is_empty()) {
+            Some(p) => {
+                let p = PathBuf::from(p);
+                space.check_archive(&p)?;
+                Some(p)
+            }
+            None => None,
+        };
+        let next = Space::new(space.home.clone(), archive.clone())?;
+        // Keep the rest of the file (extra protected folders) as it is.
+        let mut saved = crate::settings::Settings::load();
+        saved.archive = archive;
+        saved.setup_done = true;
+        saved.save()?;
+        *self
+            .inner
+            .space
+            .write()
+            .map_err(|_| "Internal state unavailable".to_string())? = Some(next);
+        *lock(&self.inner.facts)? = None;
+        lock(&self.inner.cards)?.retain(|c| !c.id.starts_with('p'));
+        self.settings_view()
     }
     fn complete_overview(&self) -> Result<Value, String> {
         let overview = lock(&self.inner.overview)?.clone();
@@ -540,7 +601,7 @@ impl Bridge {
                 return Ok(f);
             }
         }
-        let f = advisor::gather(self.space()?, &overview);
+        let f = advisor::gather(&self.space()?, &overview);
         *lock(&self.inner.facts)? = Some(f.clone());
         Ok(f)
     }
@@ -838,8 +899,13 @@ impl Bridge {
                                 .is_ok_and(|m| !m.file_type().is_symlink())
                     });
                 }
-                let archive = space.archive.to_string_lossy().into_owned();
-                let to = (card.action == Action2::Move).then_some(archive.as_str());
+                let archive = space
+                    .archive
+                    .as_ref()
+                    .map(|a| a.to_string_lossy().into_owned());
+                let to = (card.action == Action2::Move)
+                    .then_some(archive.as_deref())
+                    .flatten();
                 self.shift(&card.kind, outcome.freed, Some(&home), to)?;
                 if let Some(id) = &outcome.undo {
                     lock(&self.inner.undo_kinds)?.insert(id.clone(), card.kind.clone());
@@ -850,13 +916,14 @@ impl Bridge {
             }
             Action::Undo => {
                 let id = r.id.as_deref().ok_or("Undo ID required")?;
+                // Undo copies back from wherever the batch was moved to.
+                let from = space.batch_root(id);
                 let outcome = space.undo(id);
                 let kind = lock(&self.inner.undo_kinds)?
                     .get(id)
                     .cloned()
                     .unwrap_or_else(|| "other".into());
-                let archive = space.archive.to_string_lossy().into_owned();
-                self.shift(&kind, outcome.freed, Some(&archive), Some(&home))?;
+                self.shift(&kind, outcome.freed, from.as_deref(), Some(&home))?;
                 Ok(
                     json!({"outcome": outcome, "disks": self.disk_view()?, "undo": self.undo_list()?}),
                 )
@@ -916,7 +983,10 @@ impl Bridge {
                 if c.id.starts_with('p') {
                     c.issue = g.title_for(&c.paths);
                 }
-                c.target = Some(placement::target(&space.archive, &c.paths));
+                c.target = space
+                    .archive
+                    .as_deref()
+                    .map(|a| placement::target(a, &c.paths));
             }
             live_paths.extend(live);
             kept.push(c);
@@ -1003,8 +1073,9 @@ fn scan_other_disks(inner: &Arc<Inner>) {
         let disks = advisor::disks(&overview);
         let home = inner
             .space
-            .as_ref()
-            .map(|s| s.home.clone())
+            .read()
+            .ok()
+            .and_then(|s| s.as_ref().map(|s| s.home.clone()))
             .unwrap_or_default();
         let home_mount = disks
             .iter()
@@ -1016,6 +1087,7 @@ fn scan_other_disks(inner: &Arc<Inner>) {
                 continue;
             }
             let out = std::process::Command::new("python3")
+                .host_env()
                 .arg("-c")
                 .arg(include_str!("../../scripts/storage-overview.py"))
                 .args(["--kinds", &d.mount])
@@ -1373,7 +1445,7 @@ mod tests {
     fn recheck_drops_finished_paths_and_cards_without_rescan() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
-        let space = Space::new(home.clone(), dir.path().join("archive")).unwrap();
+        let space = Space::new(home.clone(), Some(dir.path().join("archive"))).unwrap();
         let b = Bridge::with_space(None, Some(space.clone()));
         let a = home.join("Videos/a.mp4");
         let v = home.join("Videos/b.mp4");
@@ -1426,7 +1498,7 @@ mod tests {
     fn exec_runs_only_app_commands_after_confirm_and_never_root() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
-        let space = Space::new(home.clone(), dir.path().join("archive")).unwrap();
+        let space = Space::new(home.clone(), Some(dir.path().join("archive"))).unwrap();
         let b = Bridge::with_space(None, Some(space));
         let uv = home.join(".cache/uv/wheels-v5/blob");
         std::fs::create_dir_all(uv.parent().unwrap()).unwrap();
@@ -1463,6 +1535,7 @@ mod tests {
         assert!(exec(&delete.id, true).unwrap_err().contains("own cleanup"));
         assert!(exec(&ok.id, false).unwrap_err().contains("Confirm"));
         if std::process::Command::new("uv")
+            .host_env()
             .arg("--version")
             .output()
             .is_err()

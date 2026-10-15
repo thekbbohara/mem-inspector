@@ -1,7 +1,9 @@
 mod advisor;
 mod bridge;
 mod evidence;
+mod hostenv;
 mod placement;
+mod settings;
 mod space;
 mod tools;
 use tauri_plugin_dialog::DialogExt;
@@ -21,6 +23,18 @@ async fn request(
         .await
         .map_err(|e| e.to_string())?;
         return Ok(serde_json::json!({"root": path.map(|p| p.to_string())}));
+    }
+    if matches!(request.action, bridge::Action::Pick) {
+        // Folder for personal files; the backend checks it on SetArchive.
+        let path = tauri::async_runtime::spawn_blocking(move || {
+            app.dialog()
+                .file()
+                .set_title("Where should personal files go?")
+                .blocking_pick_folder()
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        return Ok(serde_json::json!({"path": path.map(|p| p.to_string())}));
     }
     let shared = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || shared.request(request))

@@ -3,6 +3,7 @@
 //! The UI never sends a command line. It sends a card id; the command comes
 //! from this fixed list, built for the scanned home. Commands that need root
 //! are shown, never run: nothing here calls sudo, doas, pkexec, su or run0.
+use crate::hostenv::HostEnv;
 use serde::{Deserialize, Serialize};
 use std::{
     io::Read,
@@ -145,6 +146,7 @@ impl Tool {
             Tool::DockerBuild | Tool::DockerImages => {
                 on_path("docker")
                     && std::process::Command::new("docker")
+                        .host_env()
                         .args(["info", "--format", "{{.ID}}"])
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())
@@ -202,6 +204,7 @@ fn quote(s: &str) -> String {
 
 pub fn du(path: &Path) -> u64 {
     std::process::Command::new("du")
+        .host_env()
         .args(["-sx", "-B1", "--"])
         .arg(path)
         .stderr(std::process::Stdio::null())
@@ -236,6 +239,7 @@ pub fn parse_docker_size(text: &str) -> u64 {
 
 fn docker_reclaimable(kind: &str) -> u64 {
     std::process::Command::new("docker")
+        .host_env()
         .args(["system", "df", "--format", "{{.Type}}\t{{.Reclaimable}}"])
         .stderr(std::process::Stdio::null())
         .output()
@@ -286,6 +290,12 @@ impl Run {
         let mut builder = CommandBuilder::new(&cmd.argv[0]);
         builder.args(&cmd.argv[1..]);
         builder.cwd(cwd);
+        for (k, v) in crate::hostenv::changes() {
+            match v {
+                Some(v) => builder.env(k, v),
+                None => builder.env_remove(k),
+            }
+        }
         builder.env("TERM", "xterm-256color");
         for (k, v) in &cmd.env {
             builder.env(k, v);

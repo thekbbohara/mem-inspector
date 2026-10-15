@@ -28,7 +28,8 @@
   "bundle": {
     "active": true,
     "targets": [
-      "deb"
+      "deb",
+      "appimage"
     ],
     "shortDescription": "Local disk inspection with deliberate, recoverable cleanup",
     "icon": [

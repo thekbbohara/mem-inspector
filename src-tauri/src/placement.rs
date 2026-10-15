@@ -290,7 +290,10 @@ pub fn find(space: &Space, overview: &Value) -> Vec<Place> {
         if space.guard_with(Kind::Move, &path, &open).is_err() {
             continue;
         }
-        if fs::symlink_metadata(space.archived(&path)).is_ok() {
+        if space
+            .archived(&path)
+            .is_some_and(|a| fs::symlink_metadata(a).is_ok())
+        {
             continue;
         }
         taken.push(path);
@@ -384,7 +387,7 @@ mod tests {
     fn finds_media_models_archives_downloads_projects_and_skips_unsafe() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
-        let space = Space::new(home.clone(), dir.path().join("archive")).unwrap();
+        let space = Space::new(home.clone(), Some(dir.path().join("archive"))).unwrap();
         let video = home.join("Videos/trip.mkv");
         let model = home.join("models/llama.gguf");
         let fresh_model = home.join("models/daily.gguf");
@@ -478,8 +481,14 @@ mod tests {
             "{all:?}"
         );
         assert_eq!(
-            target(&space.archive, &[video.to_string_lossy().into()]),
-            space.archived(&home.join("Videos")).to_string_lossy()
+            target(
+                space.archive.as_deref().unwrap(),
+                &[video.to_string_lossy().into()]
+            ),
+            space
+                .archived(&home.join("Videos"))
+                .unwrap()
+                .to_string_lossy()
         );
     }
 
@@ -487,7 +496,7 @@ mod tests {
     fn files_open_in_a_running_process_are_not_offered() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
-        let space = Space::new(home.clone(), dir.path().join("archive")).unwrap();
+        let space = Space::new(home.clone(), Some(dir.path().join("archive"))).unwrap();
         let video = home.join("Videos/live.mp4");
         write(&video, 10);
         let open = OpenFiles::with(vec![video.clone()]);
@@ -530,7 +539,11 @@ fn real_home_placement() {
             p.group,
             crate::advisor::human(p.bytes),
             p.path,
-            target(&space.archive, std::slice::from_ref(&p.path))
+            space
+                .archive
+                .as_deref()
+                .map(|a| target(a, std::slice::from_ref(&p.path)))
+                .unwrap_or_default()
         );
     }
 }

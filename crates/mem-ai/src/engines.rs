@@ -40,9 +40,24 @@ fn home() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_default()
 }
+/// The CLI's own config folder: its env override when set and absolute,
+/// else the folder the CLI uses by default.
 fn default_account(name: &str) -> PathBuf {
+    let env = match name {
+        "claude" => "CLAUDE_CONFIG_DIR",
+        "codex" => "CODEX_HOME",
+        _ => "",
+    };
+    if let Some(dir) = (!env.is_empty())
+        .then(|| std::env::var_os(env))
+        .flatten()
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        return dir;
+    }
     home().join(match name {
-        "claude" => ".claude-work",
+        "claude" => ".claude",
         "codex" => ".codex",
         "kimi" => ".kimi-code",
         "pi" => ".pi/agent",
@@ -74,13 +89,28 @@ fn blocker(reason: &str) -> Error {
     Error::Blocker(reason.into())
 }
 
+/// PATH without the AppImage bundle's folders, so the user's own CLI runs.
+fn host_path() -> Option<std::ffi::OsString> {
+    let path = std::env::var_os("PATH")?;
+    let Some(appdir) = std::env::var("APPDIR").ok().filter(|d| d.starts_with('/')) else {
+        return Some(path);
+    };
+    let kept: Vec<PathBuf> = std::env::split_paths(&path)
+        .filter(|p| !p.starts_with(&appdir))
+        .collect();
+    std::env::join_paths(kept).ok()
+}
+
 pub(super) fn base_command(
     name: &str,
     settings: Option<&EngineSettings>,
 ) -> Result<Command, Error> {
     let mut c = Command::new(name);
     c.env_clear();
-    for key in ["PATH", "HOME", "SSL_CERT_FILE", "SSL_CERT_DIR"] {
+    if let Some(path) = host_path() {
+        c.env("PATH", path);
+    }
+    for key in ["HOME", "SSL_CERT_FILE", "SSL_CERT_DIR"] {
         if let Some(v) = std::env::var_os(key) {
             c.env(key, v);
         }
@@ -88,8 +118,14 @@ pub(super) fn base_command(
     let dir = account(name, settings)?;
     match name {
         "claude" => {
-            c.env("CLAUDE_CONFIG_DIR", dir)
-                .env("CLAUDE_CODE_SAFE_MODE", "1");
+            // Only pass a folder that was chosen: Claude's built-in default
+            // also reads ~/.claude.json, which CLAUDE_CONFIG_DIR=~/.claude would skip.
+            let chosen = settings.is_some_and(|s| !s.account.is_empty())
+                || std::env::var_os("CLAUDE_CONFIG_DIR").is_some();
+            if chosen {
+                c.env("CLAUDE_CONFIG_DIR", dir);
+            }
+            c.env("CLAUDE_CODE_SAFE_MODE", "1");
         }
         "codex" => {
             c.env("CODEX_HOME", dir);

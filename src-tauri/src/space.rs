@@ -1,6 +1,7 @@
 //! Owner-approved mutations: delete rebuildable data, archive cold files with a
 //! symlink back, undo archives. Every path passes `Space::guard` immediately
 //! before it is touched. Symlinks are never followed.
+use crate::hostenv::HostEnv;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -40,8 +41,6 @@ const PROTECTED: &[&str] = &[
     ".aws",
     ".kube",
     ".netrc",
-    ".wednesday",
-    ".jarvis",
     ".mozilla",
     ".thunderbird",
     ".local/share/keyrings",
@@ -76,7 +75,8 @@ pub enum Kind {
 #[derive(Debug, Clone)]
 pub struct Space {
     pub home: PathBuf,
-    pub archive: PathBuf,
+    /// Folder on a second disk for personal files. None: moves are off.
+    pub archive: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -86,6 +86,10 @@ pub struct Moved {
     pub bytes: u64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dir: bool,
+    /// Archive folder at move time, so undo still works after the user picks
+    /// another folder or turns moves off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LogEntry {
@@ -113,8 +117,9 @@ fn clean(path: &Path) -> bool {
 }
 
 impl Space {
-    /// Home and archive default to $HOME and /mnt/data2/archive. Tests and
-    /// rehearsals override both with MEM_INSPECTOR_SCAN_HOME / MEM_INSPECTOR_ARCHIVE.
+    /// Home is $HOME; the archive is the folder the user picked (settings).
+    /// Tests and rehearsals override both with MEM_INSPECTOR_SCAN_HOME /
+    /// MEM_INSPECTOR_ARCHIVE.
     pub fn from_env() -> Result<Self, String> {
         let home = std::env::var_os("MEM_INSPECTOR_SCAN_HOME")
             .or_else(|| std::env::var_os("HOME"))
@@ -122,17 +127,49 @@ impl Space {
             .ok_or("Home directory unavailable")?;
         let archive = std::env::var_os("MEM_INSPECTOR_ARCHIVE")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/mnt/data2/archive"));
-        Self::new(home, archive)
+            .or_else(|| crate::settings::Settings::load().archive);
+        // A saved folder that became invalid turns moves off rather than the app.
+        Self::new(home.clone(), archive).or_else(|_| Self::new(home, None))
     }
-    pub fn new(home: PathBuf, archive: PathBuf) -> Result<Self, String> {
-        if !clean(&home) || !clean(&archive) || home == Path::new("/") {
-            return Err("Home and archive must be plain absolute paths".into());
+    pub fn new(home: PathBuf, archive: Option<PathBuf>) -> Result<Self, String> {
+        if !clean(&home) || home == Path::new("/") {
+            return Err("Home must be a plain absolute path".into());
         }
-        if archive.starts_with(&home) || home.starts_with(&archive) {
-            return Err("Archive must live outside home".into());
+        if let Some(archive) = &archive {
+            if !clean(archive) {
+                return Err("The archive folder must be a plain absolute path".into());
+            }
+            if archive.starts_with(&home) || home.starts_with(archive) {
+                return Err("Pick a folder outside your home folder".into());
+            }
         }
         Ok(Self { home, archive })
+    }
+    /// The archive folder, or why moves are off.
+    pub fn archive_dir(&self) -> Result<&Path, String> {
+        self.archive
+            .as_deref()
+            .ok_or_else(|| "Moves are off: pick a folder on a second disk in Settings".into())
+    }
+    /// Checks a folder the user picked for personal files: an existing,
+    /// writable folder outside home, on a different disk than home.
+    pub fn check_archive(&self, archive: &Path) -> Result<(), String> {
+        Self::new(self.home.clone(), Some(archive.to_path_buf()))?;
+        let meta = fs::metadata(archive).map_err(|_| "That folder does not exist".to_string())?;
+        if !meta.is_dir() {
+            return Err("That is not a folder".into());
+        }
+        let home_dev = fs::metadata(&self.home).map_err(|e| e.to_string())?.dev();
+        if meta.dev() == home_dev {
+            return Err(
+                "That folder is on the same disk as your home, so moving there frees nothing. Pick one on a second disk."
+                    .into(),
+            );
+        }
+        let probe = archive.join(format!(".mem-inspector-probe-{}", std::process::id()));
+        fs::File::create(&probe)
+            .and_then(|_| fs::remove_file(&probe))
+            .map_err(|_| "You cannot write to that folder".to_string())
     }
     fn log_path(&self) -> PathBuf {
         self.home.join(".local/state/mem-inspector/moves.jsonl")
@@ -153,6 +190,9 @@ impl Space {
             .unwrap_or("");
         PROTECTED.iter().any(|p| rel.starts_with(p))
             || PROTECTED_PREFIXES.iter().any(|p| first.starts_with(p))
+            || crate::settings::protected_extra()
+                .iter()
+                .any(|p| rel.starts_with(p))
     }
     pub fn cache_root(&self, path: &Path) -> Option<&'static str> {
         let rel = self.rel(path)?;
@@ -233,6 +273,7 @@ impl Space {
     /// running process, anything owned by someone else or on another disk.
     fn guard_move(&self, path: &Path, meta: &fs::Metadata, open: &OpenFiles) -> Result<(), String> {
         let shown = path.display();
+        self.archive_dir()?;
         let rel = self
             .rel(path)
             .ok_or_else(|| format!("{shown}: outside home"))?;
@@ -322,8 +363,10 @@ impl Space {
         out
     }
 
-    pub fn archived(&self, path: &Path) -> PathBuf {
-        self.archive.join(path.strip_prefix("/").unwrap_or(path))
+    /// Where a path lands in the archive. None when moves are off.
+    pub fn archived(&self, path: &Path) -> Option<PathBuf> {
+        let archive = self.archive.as_ref()?;
+        Some(archive.join(path.strip_prefix("/").unwrap_or(path)))
     }
 
     /// Copy to the archive, verify sizes and counts, then swap the original
@@ -332,6 +375,13 @@ impl Space {
     pub fn archive(&self, paths: &[PathBuf]) -> Outcome {
         let id = format!("m{}", now_nanos());
         let mut out = Outcome::default();
+        let archive = match self.archive_dir() {
+            Ok(a) => a.to_path_buf(),
+            Err(e) => {
+                out.failed.push(e);
+                return out;
+            }
+        };
         let open = OpenFiles::scan();
         let mut checked = Vec::new();
         for path in paths {
@@ -349,12 +399,12 @@ impl Space {
         }
         progress_start(checked.iter().map(|c| c.2.bytes).sum());
         for (path, meta, stats) in checked {
-            let to = self.archived(path);
+            let to = archive.join(path.strip_prefix("/").unwrap_or(path));
             let result = (|| {
                 if fs::symlink_metadata(&to).is_ok() {
                     return Err(format!("{}: already archived", to.display()));
                 }
-                let room = free_bytes(&self.archive);
+                let room = free_bytes(&archive);
                 if room < stats.bytes + MIN_ARCHIVE_ROOM {
                     return Err(format!("{}: not enough room on the HDD", path.display()));
                 }
@@ -377,6 +427,7 @@ impl Space {
                     to: to.to_string_lossy().into(),
                     bytes: stats.blocks,
                     dir: meta.is_dir(),
+                    root: Some(archive.to_string_lossy().into()),
                 };
                 // Log before the source disappears so undo always knows the pair.
                 self.append(&LogEntry {
@@ -457,6 +508,15 @@ impl Space {
         batches
     }
 
+    /// The archive folder a batch was moved to.
+    pub fn batch_root(&self, id: &str) -> Option<String> {
+        let (_, items) = self.undoable().into_iter().find(|(b, _)| b == id)?;
+        items
+            .first()
+            .and_then(|m| m.root.clone())
+            .or_else(|| self.archive.as_ref().map(|a| a.to_string_lossy().into()))
+    }
+
     pub fn undo(&self, id: &str) -> Outcome {
         let mut out = Outcome::default();
         let Some((_, items)) = self.undoable().into_iter().find(|(b, _)| b == id) else {
@@ -471,7 +531,12 @@ impl Space {
                     return Err(format!("{}: link changed, left alone", m.from));
                 }
                 let meta = fs::symlink_metadata(&to).map_err(|e| e.to_string())?;
-                if !(meta.is_file() || meta.is_dir()) || !to.starts_with(&self.archive) {
+                let root = m
+                    .root
+                    .as_ref()
+                    .map(PathBuf::from)
+                    .or_else(|| self.archive.clone());
+                if !(meta.is_file() || meta.is_dir()) || !root.is_some_and(|r| to.starts_with(r)) {
                     return Err(format!("{}: archive copy missing", m.to));
                 }
                 let parked = sibling(&from, "mem-undo");
@@ -860,6 +925,7 @@ fn git_ignored(path: &Path) -> bool {
         return false;
     };
     let ignored = std::process::Command::new("git")
+        .host_env()
         .arg("-C")
         .arg(dir)
         .args(["check-ignore", "-q", "--"])
@@ -869,6 +935,7 @@ fn git_ignored(path: &Path) -> bool {
         .status()
         .is_ok_and(|s| s.success());
     let tracked = std::process::Command::new("git")
+        .host_env()
         .arg("-C")
         .arg(dir)
         .args(["ls-files", "--error-unmatch", "--"])
@@ -1001,7 +1068,7 @@ mod tests {
         let home = dir.path().join("home");
         let archive = dir.path().join("archive");
         fs::create_dir_all(&home).unwrap();
-        let space = Space::new(home, archive).unwrap();
+        let space = Space::new(home, Some(archive)).unwrap();
         (dir, space)
     }
     fn write(path: &Path, bytes: usize) {
@@ -1016,9 +1083,8 @@ mod tests {
         for p in [
             ".ssh/x",
             ".gnupg/x",
-            ".claude-work/x",
+            ".claude-alt/x",
             ".codex-2/x",
-            ".wednesday/x",
             ".config/google-chrome/x",
             ".local/share/keyrings/x",
         ] {
@@ -1059,7 +1125,7 @@ mod tests {
         assert!(s.guard(Kind::Delete, &h.join("crate/target")).is_ok());
         assert!(s.guard(Kind::Command, &h.join("crate/target")).is_err());
         assert!(s.guard(Kind::Delete, &s.home).is_err());
-        assert!(Space::new(s.home.clone(), s.home.join("archive")).is_err());
+        assert!(Space::new(s.home.clone(), Some(s.home.join("archive"))).is_err());
     }
 
     #[test]
@@ -1100,7 +1166,7 @@ mod tests {
         let before = fs::metadata(&video).unwrap().modified().unwrap();
         let out = s.archive(std::slice::from_ref(&video));
         assert!(out.failed.is_empty(), "{:?}", out.failed);
-        let target = s.archive.join(video.strip_prefix("/").unwrap());
+        let target = s.archived(&video).unwrap();
         assert_eq!(fs::read_link(&video).unwrap(), target);
         assert_eq!(
             fs::read(&video).unwrap().len(),
@@ -1135,7 +1201,11 @@ mod tests {
         {
             return;
         }
-        let s = Space::new(home_dir.path().join("h"), archive_dir.path().join("a")).unwrap();
+        let s = Space::new(
+            home_dir.path().join("h"),
+            Some(archive_dir.path().join("a")),
+        )
+        .unwrap();
         let file = s.home.join("Videos/x.mp4");
         write(&file, 70_000);
         let out = s.archive(std::slice::from_ref(&file));
@@ -1147,7 +1217,7 @@ mod tests {
         assert_eq!(fs::read(&file).unwrap(), vec![7u8; 70_000]);
         assert!(s.undo(&out.undo.unwrap()).failed.is_empty());
         assert!(fs::symlink_metadata(&file).unwrap().is_file());
-        assert!(!s.archived(&file).exists());
+        assert!(!s.archived(&file).unwrap().exists());
     }
 
     fn age_tree(root: &Path, days: i64) {
@@ -1184,7 +1254,7 @@ mod tests {
         let out = s.archive(std::slice::from_ref(&dir));
         assert!(out.failed.is_empty(), "{:?}", out.failed);
         assert_eq!(out.done, 1);
-        let target = s.archived(&dir);
+        let target = s.archived(&dir).unwrap();
         assert_eq!(fs::read_link(&dir).unwrap(), target);
         assert_eq!(
             fs::read(dir.join("nested/deep/b.txt")).unwrap().len(),
@@ -1233,7 +1303,11 @@ mod tests {
         {
             return;
         }
-        let s = Space::new(home_dir.path().join("h"), archive_dir.path().join("a")).unwrap();
+        let s = Space::new(
+            home_dir.path().join("h"),
+            Some(archive_dir.path().join("a")),
+        )
+        .unwrap();
         fs::create_dir_all(&s.home).unwrap();
         folder_move_round_trip(&s);
     }
@@ -1326,7 +1400,7 @@ mod tests {
         let dir = s.home.join("Downloads/old");
         write(&dir.join("a"), 10);
         age_tree(&dir, 40);
-        write(&s.archived(&dir).join("other"), 1);
+        write(&s.archived(&dir).unwrap().join("other"), 1);
         let out = s.archive(std::slice::from_ref(&dir));
         assert_eq!(out.done, 0);
         assert!(out.failed[0].contains("already archived"));
@@ -1349,7 +1423,7 @@ mod tests {
         assert_eq!(fs::read(&a).unwrap().len(), 3);
         let b = s.home.join("Downloads/b.iso");
         write(&b, 10);
-        write(&s.archived(&b), 1);
+        write(&s.archived(&b).unwrap(), 1);
         let out = s.archive(std::slice::from_ref(&b));
         assert_eq!(out.done, 0);
         assert!(fs::symlink_metadata(&b).unwrap().is_file());

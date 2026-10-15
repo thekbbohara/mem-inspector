@@ -56,7 +56,7 @@ def classify(path, root):
         return ('Trash', 'Review', 'Already trashed data. Review original locations and recovery needs before emptying Trash in your file manager.')
     if parts[0] in ('Downloads', 'Videos', 'Pictures', 'Documents'):
         return ('Personal media / documents', 'Keep', 'Personal data. Review large archives and media for backup or placement, never assume disposable.')
-    if any(x in parts for x in ('worktrees', '.jarvis', '.wednesday')):
+    if any(x in parts for x in ('worktrees',)):
         return ('Agent workspaces', 'Keep', 'May contain uncommitted work, logs and deliverables. Check git status and active tasks before archiving any workspace.')
     if any(x in parts for x in ('.codex', '.claude', '.agents', '.local')):
         return ('Application / agent state', 'Keep', 'May contain credentials, history, installed tools and models. Use application-specific retention controls.')
