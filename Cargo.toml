@@ -1,0 +1,9 @@
+[workspace]
+members = ["src-tauri"]
+exclude = ["crates/mem-core", "crates/mem-ai"]
+resolver = "2"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,27 @@
+# Dependencies and build output
+node_modules/
+dist/
+target/
+src-tauri/gen/
+*.tgz
+*.deb
+*.rpm
+*.AppImage
+__pycache__/
+
+# Local test fixtures
+test/fixtures/
+
+# Secrets and local config
+.env
+.env.*
+*.pem
+*.key
+
+# Local data: never commit real scan results, databases or evidence
+scan*.json
+*.db
+*.sqlite
+*.sqlite3
+evidence/
+screenshots/

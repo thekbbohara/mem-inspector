@@ -1,0 +1,23 @@
+[package]
+name = "mem-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT"
+description = "Bounded, nofollow disk inspection and explicitly reviewed Linux Trash operations"
+
+[workspace]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"

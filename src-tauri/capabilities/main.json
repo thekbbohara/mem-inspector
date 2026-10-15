@@ -1,0 +1,6 @@
+{
+  "identifier": "main",
+  "description": "Only the main local inspector window",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
