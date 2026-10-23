@@ -150,6 +150,9 @@ pub struct Place {
     pub dir: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idle_days: Option<u64>,
+    /// A VM disk that stays: why, shown on its card. Never moved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub held: Option<&'static str>,
 }
 
 fn now() -> u64 {
@@ -177,7 +180,9 @@ fn days_since(t: i64) -> u64 {
     now().saturating_sub(t.max(0) as u64) / DAY
 }
 
-/// Candidates by group, biggest first, each one passing the move guard.
+/// Candidates by group, biggest first, each one passing the move guard. A VM
+/// disk refused only because a VM runs on it or used it lately comes back
+/// with `held` set, so its card can say why it stays.
 pub fn find(space: &Space, overview: &Value) -> Vec<Place> {
     let open = OpenFiles::scan();
     let mut raw: Vec<Place> = Vec::new();
@@ -200,6 +205,7 @@ pub fn find(space: &Space, overview: &Value) -> Vec<Place> {
                 group: Group::Projects,
                 dir: true,
                 idle_days: Some(days.min(days_since(newest))),
+                held: None,
             });
         }
     }
@@ -216,6 +222,7 @@ pub fn find(space: &Space, overview: &Value) -> Vec<Place> {
                         group: Group::Android,
                         dir: true,
                         idle_days: None,
+                        held: None,
                     });
                 }
             }
@@ -254,6 +261,7 @@ pub fn find(space: &Space, overview: &Value) -> Vec<Place> {
                 group,
                 dir: false,
                 idle_days: Some(days_since(mtime.max(atime))),
+                held: None,
             });
         }
     }
@@ -271,6 +279,7 @@ pub fn find(space: &Space, overview: &Value) -> Vec<Place> {
                 group: Group::Downloads,
                 dir: d["dir"].as_bool().unwrap_or(false),
                 idle_days: Some(days_since(newest)),
+                held: None,
             });
         }
     }
@@ -287,7 +296,18 @@ pub fn find(space: &Space, overview: &Value) -> Vec<Place> {
         {
             continue;
         }
-        if space.guard_with(Kind::Move, &path, &open).is_err() {
+        if let Err(e) = space.guard_with(Kind::Move, &path, &open) {
+            let busy = fs::symlink_metadata(&path)
+                .ok()
+                .and_then(|m| space.vm_busy(&path, &m, &open));
+            // Every other check passed: the VM is the only reason it stays.
+            if let Some(why) = busy.filter(|w| e == format!("{}: {w}", path.display())) {
+                taken.push(path);
+                out.push(Place {
+                    held: Some(why),
+                    ..p
+                });
+            }
             continue;
         }
         if space
@@ -387,7 +407,7 @@ mod tests {
     fn finds_media_models_archives_downloads_projects_and_skips_unsafe() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
-        let space = Space::new(home.clone(), Some(dir.path().join("archive"))).unwrap();
+        let space = Space::same_disk(home.clone(), dir.path().join("archive"));
         let video = home.join("Videos/trip.mkv");
         let model = home.join("models/llama.gguf");
         let fresh_model = home.join("models/daily.gguf");
@@ -493,10 +513,30 @@ mod tests {
     }
 
     #[test]
+    fn busy_vm_disks_are_held_with_a_reason_not_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let space = Space::same_disk(home.clone(), dir.path().join("archive"));
+        let fresh = home.join("VMs/daily.qcow2");
+        let idle = home.join("VMs/old.qcow2");
+        write(&fresh, 10);
+        write(&idle, 10);
+        age(&idle, 40);
+        let gb = 1u64 << 30;
+        let overview = json!({"bigFiles": [big(&fresh, gb, 1), big(&idle, gb, 40)]});
+        let found = find(&space, &overview);
+        let one = |p: &Path| found.iter().find(|f| Path::new(&f.path) == p).cloned();
+        assert_eq!(one(&idle).unwrap().held, None, "{found:?}");
+        let held = one(&fresh).expect("held, not dropped");
+        assert_eq!(held.held, Some("VM changed it in the last 30 days"));
+        assert_eq!(held.group, Group::Archives);
+    }
+
+    #[test]
     fn files_open_in_a_running_process_are_not_offered() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
-        let space = Space::new(home.clone(), Some(dir.path().join("archive"))).unwrap();
+        let space = Space::same_disk(home.clone(), dir.path().join("archive"));
         let video = home.join("Videos/live.mp4");
         write(&video, 10);
         let open = OpenFiles::with(vec![video.clone()]);

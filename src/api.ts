@@ -25,6 +25,8 @@ export type Card = {
   group?: string;
   target?: string;
   tradeoff?: string;
+  /** Shown with its reason in `fix`, never run (a VM disk in use). */
+  held?: boolean;
 };
 export type Row = { path: string; bytes: number; ok?: boolean };
 export type Plan = {
@@ -95,6 +97,8 @@ export const api = {
       DiskState & {
         home: string;
         archive: string | null;
+        /** Set when the archive drive is unplugged: moves are paused. */
+        paused: string | null;
         scannedAt: number | null;
       }
     >({ action: "disks" }),
@@ -110,6 +114,7 @@ export const api = {
       cards: Card[];
       keep: string;
       archive: string | null;
+      paused: string | null;
       home: string;
     }>({
       action: "placement",

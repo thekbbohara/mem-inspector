@@ -61,14 +61,15 @@ impl Settings {
     }
 }
 
-/// The user's extra protected folders, read once per run.
+/// The user's extra protected folders as written, read once per run. Space
+/// resolves them against home.
 pub fn protected_extra() -> &'static [PathBuf] {
     static EXTRA: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
     EXTRA.get_or_init(|| {
         Settings::load()
             .protect
             .into_iter()
-            .filter(|p| p.is_relative() && !p.as_os_str().is_empty())
+            .filter(|p| !p.as_os_str().is_empty())
             .collect()
     })
 }

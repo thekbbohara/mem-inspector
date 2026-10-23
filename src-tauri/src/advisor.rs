@@ -2,13 +2,12 @@
 //! short suggestion cards, and validates every card against those facts. A
 //! rule-based set guarantees the screen is never empty.
 use crate::placement::{self, Group};
-use crate::space::{freeable_each, Kind, Space, CACHE_ROOTS, MOVE_CACHE_ROOTS};
+use crate::space::{freeable_each, Kind, OpenFiles, Space, CACHE_ROOTS, MOVE_CACHE_ROOTS};
 use crate::tools;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashSet,
-    fs,
     path::{Path, PathBuf},
 };
 
@@ -63,6 +62,8 @@ pub struct Facts {
     pub disks: Vec<Disk>,
     pub top: Vec<(String, u64)>,
     pub items: Vec<Item>,
+    /// VM disks that stay on the SSD, with why. Shown, never offered.
+    pub held: Vec<placement::Place>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -90,6 +91,9 @@ pub struct Suggestion {
     pub target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tradeoff: Option<String>,
+    /// Shown with its reason in `fix`, never run (a VM disk in use).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -176,12 +180,14 @@ fn idle_days(project: &Path) -> u64 {
 }
 
 /// Cleanup commands the app can offer, with what each would free. A
-/// rehearsal home only gets commands scoped to that home.
-fn system_items(home: &Path) -> Vec<Item> {
+/// rehearsal home only gets commands scoped to that home; none that clear a
+/// protected folder.
+fn system_items(space: &Space) -> Vec<Item> {
+    let home = &space.home;
     let real = std::env::var_os("HOME").is_some_and(|h| Path::new(&h) == home);
     tools::found(home, real)
         .into_iter()
-        .filter(|(_, bytes)| *bytes >= MIN_TOOL)
+        .filter(|(t, bytes)| *bytes >= MIN_TOOL && t.allowed(space))
         .map(|(t, bytes)| Item {
             path: t.key().into(),
             bytes,
@@ -224,8 +230,11 @@ pub fn gather(space: &Space, overview: &Value) -> Facts {
     let mut targets: Vec<(PathBuf, String, Option<u64>)> = Vec::new();
     for (rel, label) in CACHE_ROOTS {
         let p = space.home.join(rel);
-        if fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir())
-            && !space.protected(&p)
+        // The delete guard, minus open files: a busy cache root is still
+        // offered and clears what nothing holds. Never one reached through a symlink.
+        if space
+            .guard_with(Kind::Delete, &p, &OpenFiles::default())
+            .is_ok_and(|m| m.is_dir())
             && !MOVE_CACHE_ROOTS.contains(rel)
         {
             targets.push((p, (*label).into(), None));
@@ -262,7 +271,7 @@ pub fn gather(space: &Space, overview: &Value) -> Facts {
                 Vec::new()
             }
         });
-        let system = s.spawn(|| system_items(&space.home));
+        let system = s.spawn(|| system_items(space));
         (
             freeable_each(&paths),
             cold.join().unwrap_or_default(),
@@ -283,6 +292,8 @@ pub fn gather(space: &Space, overview: &Value) -> Facts {
             });
         }
     }
+    let (held, places): (Vec<_>, Vec<_>) = places.into_iter().partition(|p| p.held.is_some());
+    facts.held = held;
     facts.items.extend(places.into_iter().map(|p| Item {
         path: p.path,
         bytes: p.bytes,
@@ -330,6 +341,7 @@ fn card(issue: String, fix: &str, items: &[&Item]) -> Suggestion {
         group: None,
         target: None,
         tradeoff: None,
+        held: false,
     }
 }
 
@@ -360,9 +372,40 @@ pub fn placement_cards(facts: &Facts) -> Vec<Suggestion> {
             root: false,
             group: Some(g),
             tradeoff: Some(g.tradeoff().into()),
+            held: false,
         });
     }
     out.sort_by_key(|c| std::cmp::Reverse(c.bytes));
+    if let Some(first) = facts.held.first() {
+        let n = facts.held.len();
+        let why = first.held.unwrap_or_default();
+        let fix = if facts.held.iter().all(|p| p.held == first.held) {
+            let mut fix = why.to_string();
+            fix[..1].make_ascii_uppercase();
+            fix
+        } else {
+            "In use or changed in the last 30 days".into()
+        };
+        out.push(Suggestion {
+            id: String::new(),
+            issue: if n == 1 {
+                "VM disk stays on the SSD".into()
+            } else {
+                format!("{n} VM disks stay on the SSD")
+            },
+            fix,
+            action: Kind::Move,
+            paths: facts.held.iter().map(|p| p.path.clone()).collect(),
+            bytes: facts.held.iter().map(|p| p.bytes).sum(),
+            command: None,
+            kind: Group::Archives.kind().into(),
+            root: false,
+            group: None,
+            target: None,
+            tradeoff: None,
+            held: true,
+        });
+    }
     out
 }
 
@@ -446,6 +489,7 @@ fn validate(facts: &Facts, raw: &Value, used: &mut HashSet<String>) -> Option<Su
         tradeoff: group.map(|g| g.tradeoff().into()),
         group,
         paths,
+        held: false,
     })
 }
 
@@ -533,6 +577,7 @@ pub fn ask(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     fn facts() -> Facts {
         let item = |path: &str, bytes, action, days| Item {
             path: path.into(),
@@ -588,6 +633,36 @@ mod tests {
     }
 
     #[test]
+    fn held_vm_disks_get_one_quiet_card_with_the_reason_last() {
+        let mut f = facts();
+        let held = |path: &str, why| placement::Place {
+            path: path.into(),
+            bytes: 40 << 30,
+            group: Group::Archives,
+            dir: false,
+            idle_days: Some(1),
+            held: Some(why),
+        };
+        f.held = vec![held("/h/VMs/win.qcow2", "in use by a running VM")];
+        let cards = placement_cards(&f);
+        assert_eq!(cards.len(), 2);
+        let card = cards.last().unwrap();
+        assert!(card.held && card.target.is_none() && card.group.is_none());
+        assert_eq!(card.issue, "VM disk stays on the SSD");
+        assert_eq!(card.fix, "In use by a running VM");
+        assert_eq!(card.kind, "archives");
+        f.held
+            .push(held("/h/VMs/mac.vdi", "VM changed it in the last 30 days"));
+        let card = placement_cards(&f).pop().unwrap();
+        assert_eq!(card.issue, "2 VM disks stay on the SSD");
+        assert_eq!(card.fix, "In use or changed in the last 30 days");
+        assert!(
+            !compact(&f).to_string().contains("VMs"),
+            "held disks are never offered to the model"
+        );
+    }
+
+    #[test]
     fn model_cards_are_checked_against_facts() {
         let f = facts();
         let text = r#"Sure: ```json
@@ -630,16 +705,34 @@ mod tests {
     }
 
     #[test]
+    fn gather_never_offers_a_cache_root_reached_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let space = Space::same_disk(home.clone(), dir.path().join("archive"));
+        let outside = dir.path().join("elsewhere/gradle");
+        fs::create_dir_all(outside.join("caches")).unwrap();
+        fs::write(outside.join("caches/blob"), vec![1u8; 210 << 20]).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(&outside, home.join(".gradle")).unwrap();
+        let f = gather(&space, &json!({}));
+        let paths: Vec<_> = f.items.iter().map(|i| f.tilde(&i.path)).collect();
+        assert!(!paths.iter().any(|p| p.contains("gradle")), "{paths:?}");
+    }
+
+    #[test]
     fn gather_finds_caches_idle_deps_and_cold_files_on_fake_home() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
-        let space = Space::new(home.clone(), Some(dir.path().join("archive"))).unwrap();
+        let space = Space::same_disk(home.clone(), dir.path().join("archive"));
         let big = |p: &Path, n: usize| {
             fs::create_dir_all(p.parent().unwrap()).unwrap();
             fs::write(p, vec![1u8; n]).unwrap();
         };
         big(&home.join(".cache/x/blob"), 210 << 20);
         big(&home.join(".ssh/huge.mkv"), 120 << 20);
+        // Emulator disks hold installed apps and their data: not a cache.
+        let avd = home.join(".android/avd/Pixel_8.avd");
+        big(&avd.join("userdata-qemu.img"), 210 << 20);
         let nm = home.join("old/node_modules/pkg/blob");
         big(&nm, 110 << 20);
         let video = home.join("Videos/trip.mkv");
@@ -672,6 +765,9 @@ mod tests {
             "{paths:?}"
         );
         assert!(!paths.iter().any(|p| p.contains(".ssh")));
+        assert!(!paths.iter().any(|p| p.contains("avd")), "{paths:?}");
+        assert!(space.guard(Kind::Delete, &avd).is_err());
+        assert!(space.guard(Kind::Move, &avd).is_err());
         assert!(!rules(&f).is_empty());
     }
 }
@@ -682,7 +778,7 @@ mod tests {
 #[ignore = "reads the real home and calls the AI engine"]
 fn real_home_rehearsal() {
     let path = std::env::var("MEM_OVERVIEW_JSON").expect("MEM_OVERVIEW_JSON");
-    let overview: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    let overview: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let space = Space::from_env().unwrap();
     let t = std::time::Instant::now();
     let facts = gather(&space, &overview);

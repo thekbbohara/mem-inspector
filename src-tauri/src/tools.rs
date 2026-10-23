@@ -80,6 +80,19 @@ impl Tool {
             _ => None,
         }
     }
+    /// False when the command would clear a folder on the protect list, one
+    /// holding a protected folder, or, through a symlink, anything outside a
+    /// plain folder in home on home's disk.
+    pub fn allowed(self, space: &crate::space::Space) -> bool {
+        self.check(space).is_ok()
+    }
+    /// `allowed`, with why not.
+    pub fn check(self, space: &crate::space::Space) -> Result<(), String> {
+        match self.home_path(&space.home) {
+            Some(p) => space.resolve_in_home(&p).map(|_| ()),
+            None => Ok(()),
+        }
+    }
     /// Touches only the scanned home, so it is safe in a rehearsal.
     pub fn home_scoped(self) -> bool {
         self.home_path(Path::new("/")).is_some()
@@ -164,7 +177,11 @@ impl Tool {
             Tool::Journal => du(Path::new("/var/log/journal")),
             Tool::DockerBuild => docker_reclaimable("Build Cache"),
             Tool::DockerImages => docker_reclaimable("Images"),
-            Tool::Uv | Tool::GoMod => self.home_path(home).map(|p| du(&p)).unwrap_or(0),
+            // du does not follow a symlinked folder; the command does.
+            Tool::Uv | Tool::GoMod => self
+                .home_path(home)
+                .map(|p| du(&std::fs::canonicalize(&p).unwrap_or(p)))
+                .unwrap_or(0),
         }
     }
 }
@@ -363,6 +380,38 @@ mod tests {
         assert_eq!(parse_docker_size("13.32GB (56%)"), 13_320_000_000);
         assert_eq!(parse_docker_size("4.551MB (99%)"), 4_551_000);
         assert_eq!(parse_docker_size("0B"), 0);
+    }
+
+    #[test]
+    fn symlinked_cache_folders_must_lead_to_a_plain_folder_in_home() {
+        use crate::space::Space;
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let space = Space::same_disk(home.clone(), dir.path().join("archive"));
+        let outside = dir.path().join("elsewhere/uv");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(home.join(".cache")).unwrap();
+        let uv = home.join(".cache/uv");
+        let relink = |to: &Path| {
+            let _ = std::fs::remove_file(&uv);
+            std::fs::create_dir_all(to).unwrap();
+            symlink(to, &uv).unwrap();
+        };
+        relink(&outside);
+        assert!(!Tool::Uv.allowed(&space), "leads outside home");
+        relink(&home.join(".ssh/uv"));
+        assert!(!Tool::Uv.allowed(&space), "leads into a protected folder");
+        relink(&home);
+        assert!(!Tool::Uv.allowed(&space), "leads to home itself");
+        relink(&home.join("caches/uv"));
+        assert!(Tool::Uv.allowed(&space), "a plain folder in home is fine");
+        // A symlinked parent counts too: ~/go -> outside.
+        let go = dir.path().join("elsewhere/go");
+        std::fs::create_dir_all(go.join("pkg/mod")).unwrap();
+        symlink(&go, home.join("go")).unwrap();
+        assert!(!Tool::GoMod.allowed(&space));
+        assert!(Tool::Pacman.allowed(&space), "no home folder to check");
     }
 
     #[test]

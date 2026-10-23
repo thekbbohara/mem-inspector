@@ -1,5 +1,5 @@
 //! Owner-approved mutations: delete rebuildable data, archive cold files with a
-//! symlink back, undo archives. Every path passes `Space::guard` immediately
+//! symlink back, undo archives. Every path passes `Space::guard_with` immediately
 //! before it is touched. Symlinks are never followed.
 use crate::hostenv::HostEnv;
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,8 @@ use std::{
 };
 
 /// Rebuildable cache roots, relative to home. Anything inside may be deleted.
+/// Not here on purpose, they look like caches but hold user data: emulator
+/// disks (.android/avd), VM images, container storage and volumes.
 pub const CACHE_ROOTS: &[(&str, &str)] = &[
     (".cache", "App caches"),
     (".npm", "npm cache"),
@@ -24,7 +26,6 @@ pub const CACHE_ROOTS: &[(&str, &str)] = &[
     (".m2/repository", "Maven cache"),
     (".pnpm-store", "pnpm store"),
     (".local/share/pnpm/store", "pnpm store"),
-    (".android/avd", "Android emulators"),
     (".android/cache", "Android cache"),
     ("Android/Sdk/system-images", "Android system images"),
     (".local/share/Trash", "Trash"),
@@ -61,6 +62,35 @@ pub const MOVE_CACHE_ROOTS: &[&str] = &["Android/Sdk/system-images"];
 pub const DIR_IDLE_DAYS: u64 = 14;
 /// A git project counts as idle after this many days without commits or edits.
 pub const PROJECT_IDLE_DAYS: u64 = 60;
+/// VM disk images. A raw `.img` only counts inside a VM folder; elsewhere it
+/// is a USB or firmware image like any other file.
+const VM_DISK_EXTS: &[&str] = &["qcow2", "qcow", "qed", "vdi", "vmdk", "vhd", "vhdx"];
+const VM_DIRS: &[&str] = &[
+    "virtualbox vms",
+    "vms",
+    "vmware",
+    "virtual machines",
+    "libvirt",
+    "qemu",
+    "quickemu",
+    "gnome-boxes",
+];
+/// A VM disk written this recently belongs to a VM still in use. Longer than
+/// `DIR_IDLE_DAYS`: a guest booted once a month must not land on the HDD.
+pub const VM_IDLE_DAYS: u64 = 30;
+/// Hypervisors (as /proc comm, cut to 15 bytes) that name their disks on the
+/// command line, which stays readable when they run as another user and
+/// their open files do not.
+const HYPERVISORS: &[&str] = &[
+    "qemu-system-",
+    "qemu-kvm",
+    "VBoxHeadless",
+    "VirtualBoxVM",
+    "vmware-vmx",
+    "crosvm",
+    "firecracker",
+    "cloud-hyperviso",
+];
 /// Keep this much free on the HDD after a move.
 const MIN_ARCHIVE_ROOM: u64 = 1 << 30;
 
@@ -77,6 +107,11 @@ pub struct Space {
     pub home: PathBuf,
     /// Folder on a second disk for personal files. None: moves are off.
     pub archive: Option<PathBuf>,
+    /// The user's extra protected folders (settings), relative to home.
+    pub protect: Vec<PathBuf>,
+    /// Tests keep home and archive in one temp folder.
+    #[cfg(test)]
+    pub same_disk_ok: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -143,7 +178,14 @@ impl Space {
                 return Err("Pick a folder outside your home folder".into());
             }
         }
-        Ok(Self { home, archive })
+        let protect = protect_list(&home, crate::settings::protected_extra());
+        Ok(Self {
+            home,
+            archive,
+            protect,
+            #[cfg(test)]
+            same_disk_ok: false,
+        })
     }
     /// The archive folder, or why moves are off.
     pub fn archive_dir(&self) -> Result<&Path, String> {
@@ -151,8 +193,46 @@ impl Space {
             .as_deref()
             .ok_or_else(|| "Moves are off: pick a folder on a second disk in Settings".into())
     }
+    /// A home and an archive folder in one temp folder, moves allowed.
+    #[cfg(test)]
+    pub fn same_disk(home: PathBuf, archive: PathBuf) -> Self {
+        fs::create_dir_all(&archive).unwrap();
+        let mut space = Self::new(home, Some(archive)).unwrap();
+        space.same_disk_ok = true;
+        space
+    }
+    /// The archive folder, ready for a move: an existing folder on a mounted
+    /// disk other than home's and the system's. An unplugged drive leaves no
+    /// folder, or an empty mount point on the system disk, and writing there
+    /// would silently fill the wrong disk.
+    pub fn archive_ready(&self) -> Result<&Path, String> {
+        let archive = self.archive_dir()?;
+        let shown = archive.display();
+        let meta = fs::metadata(archive)
+            .map_err(|_| format!("{shown} is missing: is its drive plugged in and mounted?"))?;
+        if !meta.is_dir() {
+            return Err(format!("{shown} is not a folder"));
+        }
+        #[cfg(test)]
+        if self.same_disk_ok {
+            return Ok(archive);
+        }
+        let dev = |p: &Path| fs::metadata(p).map(|m| m.dev()).map_err(|e| e.to_string());
+        if meta.dev() == dev(&self.home)? {
+            return Err(format!(
+                "{shown} is on the same disk as your home: is its drive mounted?"
+            ));
+        }
+        if meta.dev() == dev(Path::new("/"))? {
+            return Err(format!(
+                "{shown} is on the system disk, not a second drive: is its drive mounted?"
+            ));
+        }
+        Ok(archive)
+    }
     /// Checks a folder the user picked for personal files: an existing,
-    /// writable folder outside home, on a different disk than home.
+    /// writable folder outside home, on a different disk than home and the
+    /// system.
     pub fn check_archive(&self, archive: &Path) -> Result<(), String> {
         Self::new(self.home.clone(), Some(archive.to_path_buf()))?;
         let meta = fs::metadata(archive).map_err(|_| "That folder does not exist".to_string())?;
@@ -163,6 +243,13 @@ impl Space {
         if meta.dev() == home_dev {
             return Err(
                 "That folder is on the same disk as your home, so moving there frees nothing. Pick one on a second disk."
+                    .into(),
+            );
+        }
+        let root_dev = fs::metadata("/").map_err(|e| e.to_string())?.dev();
+        if meta.dev() == root_dev {
+            return Err(
+                "That folder is on the system disk, not a mounted second drive. Pick one on the drive itself."
                     .into(),
             );
         }
@@ -190,9 +277,23 @@ impl Space {
             .unwrap_or("");
         PROTECTED.iter().any(|p| rel.starts_with(p))
             || PROTECTED_PREFIXES.iter().any(|p| first.starts_with(p))
-            || crate::settings::protected_extra()
-                .iter()
-                .any(|p| rel.starts_with(p))
+            || self.protect.iter().any(|p| rel.starts_with(p))
+    }
+    /// Protected itself or holding something protected: nothing may touch it whole.
+    pub fn off_limits(&self, path: &Path) -> bool {
+        self.protected(path) || self.holds_protected(path)
+    }
+    /// True when a protected folder lies inside `path`, so touching the whole
+    /// of `path` would touch it too.
+    fn holds_protected(&self, path: &Path) -> bool {
+        let Some(rel) = self.rel(path) else {
+            return true;
+        };
+        PROTECTED
+            .iter()
+            .map(Path::new)
+            .chain(self.protect.iter().map(PathBuf::as_path))
+            .any(|p| p.starts_with(rel))
     }
     pub fn cache_root(&self, path: &Path) -> Option<&'static str> {
         let rel = self.rel(path)?;
@@ -210,17 +311,14 @@ impl Space {
             None => false,
         }
     }
-    /// The whole safety contract for one path, rechecked right before mutation.
+    /// `guard_with` on a fresh snapshot of open files.
+    #[cfg(test)]
     pub fn guard(&self, kind: Kind, path: &Path) -> Result<fs::Metadata, String> {
-        let open = if kind == Kind::Move {
-            OpenFiles::scan()
-        } else {
-            OpenFiles::default()
-        };
-        self.guard_with(kind, path, &open)
+        self.guard_with(kind, path, &OpenFiles::scan())
     }
 
-    /// `guard` with a shared snapshot of open files, for checking many paths.
+    /// The whole safety contract for one path, rechecked right before
+    /// mutation, against one snapshot of open files shared by many paths.
     pub fn guard_with(
         &self,
         kind: Kind,
@@ -234,7 +332,7 @@ impl Space {
         if !clean(path) || self.rel(path).is_none() {
             return Err(format!("{shown}: outside home"));
         }
-        if self.protected(path) {
+        if self.off_limits(path) {
             return Err(format!("{shown}: protected"));
         }
         // No symlinked ancestor may redirect the path outside home.
@@ -253,6 +351,11 @@ impl Space {
         if meta.file_type().is_symlink() {
             return Err(format!("{shown}: symlink"));
         }
+        // remove_dir_all and copies walk into mounts; a bind mount can hold
+        // data from outside home even on the same disk.
+        if meta.is_dir() && mounts().iter().any(|m| m.starts_with(path)) {
+            return Err(format!("{shown}: another disk is mounted inside"));
+        }
         match kind {
             Kind::Delete => {
                 if self.cache_root(path).is_none() && !Self::dep_dir(path) {
@@ -260,6 +363,10 @@ impl Space {
                 }
                 if meta.is_dir() && path.join(".git").exists() {
                     return Err(format!("{shown}: git repository"));
+                }
+                // Deleting files an app has open corrupts its state or frees nothing.
+                if open.touches(path) {
+                    return Err(format!("{shown}: open in a running app"));
                 }
             }
             Kind::Move => self.guard_move(path, &meta, open)?,
@@ -273,7 +380,7 @@ impl Space {
     /// running process, anything owned by someone else or on another disk.
     fn guard_move(&self, path: &Path, meta: &fs::Metadata, open: &OpenFiles) -> Result<(), String> {
         let shown = path.display();
-        self.archive_dir()?;
+        self.archive_ready()?;
         let rel = self
             .rel(path)
             .ok_or_else(|| format!("{shown}: outside home"))?;
@@ -307,11 +414,22 @@ impl Space {
         if meta.dev() != home_dev {
             return Err(format!("{shown}: already on another disk"));
         }
+        if let Some(why) = self.vm_busy(path, meta, open) {
+            return Err(format!("{shown}: {why}"));
+        }
         if open.touches(path) {
             return Err(format!("{shown}: open in a running app"));
         }
         if meta.is_dir() {
             let stats = tree_stats(path)?;
+            // Its own history and activity check apply to a project moved
+            // whole; one swept along inside a bigger folder gets neither.
+            if let Some(git) = stats.git.as_deref().and_then(Path::parent) {
+                return Err(format!(
+                    "{shown}: holds a git project ({}), move that project on its own",
+                    git.display()
+                ));
+            }
             let age = now_nanos() / 1_000_000_000 - stats.newest.max(0) as u64;
             if age < DIR_IDLE_DAYS * 86400 {
                 return Err(format!("{shown}: changed in the last {DIR_IDLE_DAYS} days"));
@@ -325,14 +443,79 @@ impl Space {
         Ok(())
     }
 
+    /// Where a home folder really leads, for a command that follows symlinks
+    /// (`uv cache clean`, `go clean -modcache`). Only a folder that resolves
+    /// inside home, on home's disk, outside anything protected and with no
+    /// mount inside qualifies; never a symlink out of home.
+    pub fn resolve_in_home(&self, path: &Path) -> Result<PathBuf, String> {
+        let shown = path.display();
+        let home = fs::canonicalize(&self.home).map_err(|e| e.to_string())?;
+        let real = fs::canonicalize(path).map_err(|e| format!("{shown}: {e}"))?;
+        let rel = real
+            .strip_prefix(&home)
+            .map_err(|_| format!("{shown} leads outside home, to {}", real.display()))?;
+        if self.off_limits(path) || self.off_limits(&self.home.join(rel)) {
+            return Err(format!("{shown} is or leads to a protected folder"));
+        }
+        let dev = |p: &Path| fs::metadata(p).map(|m| m.dev()).map_err(|e| e.to_string());
+        if dev(&real)? != dev(&home)? {
+            return Err(format!("{shown} leads to another disk"));
+        }
+        if mounts().iter().any(|m| m.starts_with(&real)) {
+            return Err(format!("{shown}: another disk is mounted inside"));
+        }
+        Ok(real)
+    }
+    /// A VM disk image, or a folder in a VM folder.
+    pub fn vm_disk(&self, path: &Path) -> bool {
+        let Some(rel) = self.rel(path) else {
+            return false;
+        };
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        let in_vm_dir = rel
+            .components()
+            .any(|c| VM_DIRS.contains(&c.as_os_str().to_string_lossy().to_lowercase().as_str()));
+        if path.is_dir() {
+            in_vm_dir
+        } else {
+            VM_DISK_EXTS.contains(&ext.as_str()) || (in_vm_dir && ext == "img")
+        }
+    }
+    /// Why a VM disk (or VM folder) must stay put: a VM runs on it, or wrote
+    /// to it lately. None for anything else.
+    pub fn vm_busy(
+        &self,
+        path: &Path,
+        meta: &fs::Metadata,
+        open: &OpenFiles,
+    ) -> Option<&'static str> {
+        if !self.vm_disk(path) {
+            return None;
+        }
+        if open.touches(path) {
+            return Some("in use by a running VM");
+        }
+        let newest = if meta.is_dir() {
+            tree_stats(path).map(|s| s.newest).unwrap_or(i64::MAX)
+        } else {
+            meta.mtime()
+        };
+        let age = (now_nanos() / 1_000_000_000).saturating_sub(newest.max(0) as u64);
+        (age < VM_IDLE_DAYS * 86400).then_some("VM changed it in the last 30 days")
+    }
+
     pub fn delete(&self, paths: &[PathBuf]) -> Outcome {
         let mut out = Outcome {
             freed: freeable(paths),
             ..Default::default()
         };
         let mut lost = Vec::new();
+        let open = OpenFiles::scan();
         for path in paths {
-            let result = self.guard(Kind::Delete, path).and_then(|meta| {
+            let result = self.guard_with(Kind::Delete, path, &open).and_then(|meta| {
                 if meta.is_dir() {
                     // std's remove_dir_all never follows symlinks (openat + O_NOFOLLOW).
                     fs::remove_dir_all(path)
@@ -344,8 +527,30 @@ impl Space {
             match result {
                 Ok(()) => out.done += 1,
                 Err(e) => {
+                    // A cache root in use: clear each app's folder that nothing
+                    // holds open, keep the busy ones whole.
+                    let dir = fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
+                    if dir && open.touches(path) && self.cache_root(path).is_some() {
+                        let mut cleared = 0;
+                        for child in fs::read_dir(path).into_iter().flatten().flatten() {
+                            let child = child.path();
+                            match self.guard_with(Kind::Delete, &child, &open).and_then(|m| {
+                                if m.is_dir() {
+                                    fs::remove_dir_all(&child)
+                                } else {
+                                    fs::remove_file(&child)
+                                }
+                                .map_err(|e| format!("{}: {e}", child.display()))
+                            }) {
+                                Ok(()) => cleared += 1,
+                                Err(e) => out.failed.push(format!("{e}, skipped")),
+                            }
+                        }
+                        out.done += usize::from(cleared > 0);
+                    } else {
+                        out.failed.push(e);
+                    }
                     lost.push(path.clone());
-                    out.failed.push(e)
                 }
             }
         }
@@ -375,7 +580,7 @@ impl Space {
     pub fn archive(&self, paths: &[PathBuf]) -> Outcome {
         let id = format!("m{}", now_nanos());
         let mut out = Outcome::default();
-        let archive = match self.archive_dir() {
+        let archive = match self.archive_ready() {
             Ok(a) => a.to_path_buf(),
             Err(e) => {
                 out.failed.push(e);
@@ -526,6 +731,10 @@ impl Space {
         progress_start(items.iter().map(|m| m.bytes).sum());
         for m in items {
             let (from, to) = (PathBuf::from(&m.from), PathBuf::from(&m.to));
+            // Restored by an earlier, partly failed undo of this batch.
+            if fs::read_link(&from).is_err() && fs::symlink_metadata(&to).is_err() {
+                continue;
+            }
             let result = (|| {
                 if fs::read_link(&from).map_err(|e| e.to_string())? != to {
                     return Err(format!("{}: link changed, left alone", m.from));
@@ -562,6 +771,10 @@ impl Space {
             }
         }
         progress_end();
+        // Items that failed keep the batch undoable, so undo can be retried.
+        if !out.failed.is_empty() {
+            return out;
+        }
         let _ = self.append(&LogEntry {
             id: id.into(),
             time: now_nanos() / 1_000_000_000,
@@ -570,6 +783,61 @@ impl Space {
         });
         out
     }
+}
+
+/// The protect list as paths relative to home. Entries may also be written
+/// as `~/x`, `./x` or an absolute path inside home; others are dropped.
+fn protect_list(home: &Path, raw: &[PathBuf]) -> Vec<PathBuf> {
+    raw.iter()
+        .filter_map(|p| {
+            let rel = if p.is_absolute() {
+                p.strip_prefix(home).ok()?
+            } else {
+                p.strip_prefix("~").unwrap_or(p)
+            };
+            let rel: PathBuf = rel
+                .components()
+                .filter(|c| !matches!(c, Component::CurDir))
+                .collect();
+            let plain = rel.components().all(|c| matches!(c, Component::Normal(_)));
+            (plain && !rel.as_os_str().is_empty()).then_some(rel)
+        })
+        .collect()
+}
+
+/// Mount points of this process's namespace, from /proc/self/mountinfo.
+fn mounts() -> Vec<PathBuf> {
+    fs::read_to_string("/proc/self/mountinfo")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split(' ').nth(4).map(unescape_mount))
+        .collect()
+}
+
+/// Mount points escape space, tab, newline and backslash as `\ooo`.
+fn unescape_mount(field: &str) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    let b = field.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let code = b.get(i + 1..i + 4).and_then(|o| {
+            std::str::from_utf8(o)
+                .ok()
+                .and_then(|o| u8::from_str_radix(o, 8).ok())
+        });
+        match code {
+            Some(c) if b[i] == b'\\' => {
+                out.push(c);
+                i += 4;
+            }
+            _ => {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+    }
+    PathBuf::from(std::ffi::OsString::from_vec(out))
 }
 
 fn now_nanos() -> u64 {
@@ -612,6 +880,12 @@ impl OpenFiles {
                     }
                 }
             }
+            let comm = fs::read_to_string(base.join("comm")).unwrap_or_default();
+            if HYPERVISORS.iter().any(|h| comm.starts_with(h)) {
+                if let Ok(cmdline) = fs::read(base.join("cmdline")) {
+                    found.extend(cmdline_paths(&cmdline));
+                }
+            }
             if let Ok(maps) = fs::read_to_string(base.join("maps")) {
                 for line in maps.lines() {
                     if let Some(i) = line.find(" /") {
@@ -632,6 +906,16 @@ impl OpenFiles {
     }
 }
 
+/// Absolute paths inside a command line: `file=/vm/a.qcow2,if=virtio` and
+/// libvirt's `{"filename":"/vm/a.qcow2"}` both yield `/vm/a.qcow2`.
+fn cmdline_paths(cmdline: &[u8]) -> Vec<PathBuf> {
+    String::from_utf8_lossy(cmdline)
+        .split(['\0', ',', '=', '"', '\''])
+        .filter(|t| t.starts_with('/'))
+        .map(PathBuf::from)
+        .collect()
+}
+
 /// What a tree holds; a copy must match it exactly before the original goes.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct TreeStats {
@@ -643,6 +927,8 @@ pub struct TreeStats {
     /// Allocated bytes, what the SSD gets back.
     pub blocks: u64,
     pub newest: i64,
+    /// The first git project found below the root (its `.git`), if any.
+    pub git: Option<PathBuf>,
 }
 
 impl TreeStats {
@@ -675,6 +961,12 @@ pub fn tree_stats(root: &Path) -> Result<TreeStats, String> {
             return Err(format!("{shown}: owned by another user"));
         }
         stats.newest = stats.newest.max(meta.mtime());
+        if stats.git.is_none()
+            && path.file_name().is_some_and(|n| n == ".git")
+            && path.parent() != Some(root)
+        {
+            stats.git = Some(path.clone());
+        }
         let ft = meta.file_type();
         if ft.is_symlink() {
             stats.links += 1;
@@ -1066,9 +1358,8 @@ mod tests {
     fn setup() -> (tempfile::TempDir, Space) {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
-        let archive = dir.path().join("archive");
         fs::create_dir_all(&home).unwrap();
-        let space = Space::new(home, Some(archive)).unwrap();
+        let space = Space::same_disk(home, dir.path().join("archive"));
         (dir, space)
     }
     fn write(path: &Path, bytes: usize) {
@@ -1129,6 +1420,57 @@ mod tests {
     }
 
     #[test]
+    fn guards_refuse_folders_that_hold_a_protected_folder() {
+        let (_dir, mut s) = setup();
+        s.protect = vec!["Work/acme/secrets".into(), ".cache/huggingface/hub".into()];
+        let h = s.home.clone();
+        write(&h.join("Work/acme/secrets/key.txt"), 1);
+        write(&h.join("Work/acme/big.iso"), 1);
+        age_tree(&h.join("Work"), 90);
+        write(&h.join(".cache/huggingface/hub/model.bin"), 1);
+        for (kind, p) in [
+            (Kind::Move, "Work"),
+            (Kind::Move, "Work/acme"),
+            (Kind::Move, "Work/acme/secrets"),
+            (Kind::Delete, ".cache"),
+            (Kind::Delete, ".cache/huggingface"),
+            (Kind::Delete, ".cache/huggingface/hub"),
+        ] {
+            assert!(s.guard(kind, &h.join(p)).is_err(), "{p}");
+        }
+        assert!(s.guard(Kind::Move, &h.join("Work/acme/big.iso")).is_ok());
+        let out = s.delete(&[h.join(".cache")]);
+        assert_eq!(out.done, 0);
+        assert!(h.join(".cache/huggingface/hub/model.bin").exists());
+    }
+
+    #[test]
+    fn protect_list_accepts_home_absolute_and_tilde_paths() {
+        let home = Path::new("/home/me");
+        let raw: Vec<PathBuf> = [
+            "Work/a",
+            "/home/me/Work/b",
+            "~/Work/c",
+            "./Work/d",
+            "/etc/x",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        let got = protect_list(home, &raw);
+        let want: Vec<PathBuf> = ["Work/a", "Work/b", "Work/c", "Work/d"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        assert_eq!(got, want);
+        let (_dir, mut s) = setup();
+        let abs = s.home.join("Work/clients");
+        s.protect = protect_list(&s.home.clone(), std::slice::from_ref(&abs));
+        write(&abs.join("old.iso"), 1);
+        assert!(s.guard(Kind::Move, &abs.join("old.iso")).is_err());
+    }
+
+    #[test]
     fn delete_removes_for_real_without_following_symlinks() {
         let (dir, s) = setup();
         let keep = dir.path().join("keep/precious");
@@ -1142,6 +1484,116 @@ mod tests {
         assert!(keep.exists(), "symlink target must survive");
         assert!(out.freed >= 1 << 20);
         assert!(!s.home.join(".local/share/Trash").exists(), "not trashed");
+    }
+
+    #[test]
+    fn delete_skips_what_a_running_app_holds_open() {
+        let (_dir, s) = setup();
+        let cache = s.home.join(".cache");
+        let live = cache.join("browser/index.db");
+        write(&live, 10);
+        write(&cache.join("browser/entries/a"), 10);
+        write(&cache.join("pip/wheels/b"), 10);
+        let deps = s.home.join("app/node_modules");
+        write(&deps.join("x/server.js"), 10);
+        let open = OpenFiles::with(vec![live.clone(), deps.join("x")]);
+        assert!(s
+            .guard_with(Kind::Delete, &cache.join("browser"), &open)
+            .unwrap_err()
+            .contains("running app"));
+        assert!(s.guard_with(Kind::Delete, &deps, &open).is_err());
+        assert!(s
+            .guard_with(Kind::Delete, &cache.join("pip"), &open)
+            .is_ok());
+        // A real handle in another process: the app's folder stays whole,
+        // the rest of the cache goes.
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exec 3<\"$0\"; sleep 5")
+            .arg(&live)
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let out = s.delete(std::slice::from_ref(&cache));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(live.exists() && cache.join("browser/entries/a").exists());
+        assert!(!cache.join("pip").exists());
+        assert!(
+            out.failed.iter().any(|e| e.contains("running app")),
+            "{:?}",
+            out.failed
+        );
+    }
+
+    #[test]
+    fn delete_and_move_refuse_folders_with_a_disk_mounted_inside() {
+        // Mounting needs a private user and mount namespace: rerun this test
+        // inside `unshare`, and skip where that is unavailable.
+        let name = "space::tests::delete_and_move_refuse_folders_with_a_disk_mounted_inside";
+        if std::env::var_os("MEM_INSPECTOR_TEST_NS").is_none() {
+            let ns = |cmd: &[&std::ffi::OsStr]| {
+                std::process::Command::new("unshare")
+                    .args(["-rm", "--propagation", "private"])
+                    .args(cmd)
+                    .env("MEM_INSPECTOR_TEST_NS", "1")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success())
+            };
+            if !ns(&["true".as_ref()]) {
+                return;
+            }
+            let exe = std::env::current_exe().unwrap();
+            let inner = ns(&[
+                exe.as_os_str(),
+                "--exact".as_ref(),
+                name.as_ref(),
+                "--test-threads=1".as_ref(),
+            ]);
+            assert!(inner, "rerun inside a namespace failed");
+            return;
+        }
+        let (dir, s) = setup();
+        let cache = s.home.join(".cache/app");
+        let mnt = cache.join("mnt");
+        let downloads = s.home.join("Downloads/old");
+        let disk = downloads.join("disk");
+        fs::create_dir_all(&mnt).unwrap();
+        fs::create_dir_all(&disk).unwrap();
+        // A bind mount of a folder outside home, on the same disk.
+        let outside = dir.path().join("outside");
+        write(&outside.join("precious"), 10);
+        for at in [&mnt, &disk] {
+            let ok = std::process::Command::new("mount")
+                .arg("--bind")
+                .arg(&outside)
+                .arg(at)
+                .status()
+                .unwrap();
+            assert!(ok.success());
+        }
+        age_tree(&downloads, 40);
+        assert!(s.guard(Kind::Delete, &cache).is_err());
+        assert!(s.guard(Kind::Delete, &s.home.join(".cache")).is_err());
+        assert!(s.guard(Kind::Move, &downloads).is_err());
+        let out = s.delete(std::slice::from_ref(&cache));
+        assert_eq!(out.done, 0);
+        assert!(s.archive(std::slice::from_ref(&downloads)).done == 0);
+        assert!(
+            outside.join("precious").exists(),
+            "data outside home survives"
+        );
+    }
+
+    #[test]
+    fn mount_points_are_unescaped() {
+        assert_eq!(
+            unescape_mount(r"/home/me/My\040Disk\134x"),
+            Path::new(r"/home/me/My Disk\x")
+        );
+        assert!(mounts().iter().any(|m| m == Path::new("/")));
     }
 
     #[test]
@@ -1201,6 +1653,7 @@ mod tests {
         {
             return;
         }
+        fs::create_dir_all(archive_dir.path().join("a")).unwrap();
         let s = Space::new(
             home_dir.path().join("h"),
             Some(archive_dir.path().join("a")),
@@ -1303,6 +1756,7 @@ mod tests {
         {
             return;
         }
+        fs::create_dir_all(archive_dir.path().join("a")).unwrap();
         let s = Space::new(
             home_dir.path().join("h"),
             Some(archive_dir.path().join("a")),
@@ -1395,6 +1849,131 @@ mod tests {
     }
 
     #[test]
+    fn moves_refuse_vm_disks_in_use_or_changed_lately() {
+        let (dir, s) = setup();
+        let h = &s.home;
+        let idle = h.join("VMs/old.qcow2");
+        let fresh = h.join("VMs/daily.vdi");
+        let raw = h.join("VirtualBox VMs/win/disk.img");
+        let plain = h.join("Downloads/usb.img");
+        for p in [&idle, &fresh, &raw, &plain] {
+            write(p, 10);
+        }
+        age_tree(&h.join("VMs/old.qcow2"), 40);
+        age_tree(&plain, 40);
+        assert!(s.guard(Kind::Move, &idle).is_ok());
+        for p in [&fresh, &raw] {
+            assert!(
+                s.guard(Kind::Move, p)
+                    .unwrap_err()
+                    .contains("VM changed it in the last 30 days"),
+                "{p:?}"
+            );
+        }
+        // A raw image outside a VM folder is just a file.
+        assert!(s.guard(Kind::Move, &plain).is_ok());
+        // A hypervisor that names the disk on its command line holds it, even
+        // when its open files are unreadable (libvirt runs qemu as another user).
+        let qemu = dir.path().join("qemu-system-x86_64");
+        fs::copy("/bin/sh", &qemu).unwrap();
+        let mut child = std::process::Command::new(&qemu)
+            .arg("-c")
+            .arg("sleep 5; :")
+            .arg("-drive")
+            .arg(format!("file={},if=virtio,format=qcow2", idle.display()))
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let err = s.guard(Kind::Move, &idle).unwrap_err();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(err.contains("in use by a running VM"), "{err}");
+    }
+
+    #[test]
+    fn moves_refuse_folders_that_hold_a_nested_git_project() {
+        let (_dir, s) = setup();
+        let h = &s.home;
+        // A clone deep inside a downloads folder, and a repo with a nested clone.
+        write(&h.join("Downloads/old/tools/clone/.git/HEAD"), 1);
+        write(&h.join("Downloads/old/tools/clone/wip.rs"), 1);
+        write(&h.join("Downloads/old/big.iso"), 1);
+        write(&h.join("code/outer/.git/HEAD"), 1);
+        write(&h.join("code/outer/libs/inner/.git"), 1);
+        age_tree(&h.join("Downloads"), 90);
+        age_tree(&h.join("code"), 90);
+        for p in [
+            "Downloads/old",
+            "Downloads/old/tools",
+            "Downloads",
+            "code/outer",
+            "code",
+        ] {
+            assert!(
+                s.guard(Kind::Move, &h.join(p))
+                    .unwrap_err()
+                    .contains("holds a git project"),
+                "{p}"
+            );
+        }
+        let out = s.archive(&[h.join("Downloads/old")]);
+        assert_eq!(out.done, 0);
+        assert!(fs::symlink_metadata(h.join("Downloads/old"))
+            .unwrap()
+            .is_dir());
+        // The project itself still moves whole once idle; loose files beside it too.
+        assert!(s
+            .guard(Kind::Move, &h.join("Downloads/old/tools/clone"))
+            .is_ok());
+        assert!(s
+            .guard(Kind::Move, &h.join("Downloads/old/big.iso"))
+            .is_ok());
+    }
+
+    #[test]
+    fn moves_refuse_an_archive_that_is_not_a_mounted_second_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let video = home.join("Videos/old.mkv");
+        write(&video, 10);
+        let dev = |p: &Path| fs::metadata(p).unwrap().dev();
+        // Drive unplugged: the folder is gone, or an empty mount point is
+        // left on the disk that holds home.
+        let gone = dir.path().join("hdd/Archive");
+        let empty = dir.path().join("mnt-hdd");
+        fs::create_dir_all(&empty).unwrap();
+        for archive in [&gone, &empty] {
+            let s = Space::new(home.clone(), Some(archive.clone())).unwrap();
+            assert!(s.guard(Kind::Move, &video).is_err(), "{archive:?}");
+            let out = s.archive(std::slice::from_ref(&video));
+            assert_eq!(out.done, 0, "{archive:?}");
+            assert!(fs::symlink_metadata(&video).unwrap().is_file());
+        }
+        assert!(!dir.path().join("hdd").exists(), "nothing created");
+        assert!(
+            fs::read_dir(&empty).unwrap().next().is_none(),
+            "nothing written"
+        );
+        // A folder on the system disk while home sits elsewhere.
+        let root = dev(Path::new("/"));
+        if dev(Path::new("/usr")) == root && dev(&home) != root {
+            let s = Space::new(home.clone(), Some("/usr".into())).unwrap();
+            assert!(s
+                .guard(Kind::Move, &video)
+                .unwrap_err()
+                .contains("system disk"));
+        }
+        // A real second filesystem is accepted.
+        if let Ok(shm) = tempfile::tempdir_in("/dev/shm") {
+            if dev(shm.path()) != dev(&home) && dev(shm.path()) != root {
+                let s = Space::new(home.clone(), Some(shm.path().into())).unwrap();
+                let out = s.archive(std::slice::from_ref(&video));
+                assert_eq!(out.done, 1, "{:?}", out.failed);
+            }
+        }
+    }
+
+    #[test]
     fn move_fails_cleanly_when_archive_copy_exists() {
         let (_dir, s) = setup();
         let dir = s.home.join("Downloads/old");
@@ -1409,6 +1988,35 @@ mod tests {
             "original untouched"
         );
         assert_eq!(progress().1, 0, "progress reset");
+    }
+
+    #[test]
+    fn failed_undo_items_stay_undoable() {
+        let (_dir, s) = setup();
+        let a = s.home.join("Downloads/a.iso");
+        let b = s.home.join("Downloads/locked/b.iso");
+        write(&a, 10);
+        write(&b, 20);
+        let out = s.archive(&[a.clone(), b.clone()]);
+        assert_eq!(out.done, 2, "{:?}", out.failed);
+        let id = out.undo.unwrap();
+        let locked = b.parent().unwrap();
+        fs::set_permissions(locked, fs::Permissions::from_mode(0o555)).unwrap();
+        let first = s.undo(&id);
+        fs::set_permissions(locked, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            (first.done, first.failed.len()),
+            (1, 1),
+            "{:?}",
+            first.failed
+        );
+        assert!(fs::symlink_metadata(&a).unwrap().is_file());
+        assert_eq!(s.undoable().len(), 1, "b can still be undone");
+        let second = s.undo(&id);
+        assert!(second.failed.is_empty(), "{:?}", second.failed);
+        assert_eq!(fs::read(&b).unwrap().len(), 20);
+        assert_eq!(fs::read(&a).unwrap().len(), 10);
+        assert!(s.undoable().is_empty());
     }
 
     #[test]

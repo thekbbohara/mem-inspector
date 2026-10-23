@@ -43,7 +43,8 @@ A `.deb` package is also published for Debian and Ubuntu:
   that need root are shown for you to copy, never run.
 - No folder chosen means moves are off; cleanup still works.
 
-To protect more folders, add them (relative to home) to `settings.json`:
+To protect more folders, add them to `settings.json`, relative to home
+(`~/Work/clients` and absolute paths inside home work too):
 `"protect": ["Work/clients", ".my-agent"]`.
 
 ## For developers
@@ -108,7 +109,10 @@ The launcher locates its repository relative to the script. MEM_INSPECTOR_HOME c
 - **Delete** (caches and dependencies): removed for real, not to Trash, with
   std's symlink-safe `remove_dir_all`. Only paths inside the known cache roots
   or named `node_modules`/`.venv`/`venv`/`__pycache__`/`target` (next to a
-  `Cargo.toml`) qualify. Git repositories and `.git` never do.
+  `Cargo.toml`) qualify. Git repositories and `.git` never do, nor anything
+  open in a running app: a busy cache root clears only the app folders
+  nothing holds open. Emulator disks (`~/.android/avd`) are user data, not
+  cache.
 - **Move** (placement): files and whole folders go to the folder picked on
   first run + the original absolute path. Folders are copied (symlinks kept as symlinks),
   flushed with one `syncfs`, and compared by file, folder and link count and
@@ -119,7 +123,15 @@ The launcher locates its repository relative to the script. MEM_INSPECTOR_HOME c
   Moves refuse: hidden files and config (except model stores under
   `~/.ollama/models`), cache content (except Android system images), files
   tracked by git (git-ignored files in a repo may move), git projects changed
-  in the last 60 days, folders changed in the last 14 days, anything open in a
+  in the last 60 days, folders holding a git project below them (an idle
+  project moves only on its own), folders changed in the last 14 days, VM
+  disk images (`.qcow2`, `.vdi`, `.vmdk`, `.vhd(x)`, or `.img` in a VM
+  folder) written in the last 30 days or named on a running hypervisor's
+  command line (shown on a "stays on the SSD" card with the reason), an
+  archive folder that is missing or not on a mounted disk other than home's
+  and the system's (an unplugged drive: the HDD lane then says "Archive
+  drive not connected - moves paused" and rebuilds its cards when the drive
+  is back), anything open in a
   running process (open files, mapped files and working directories read from
   `/proc`, as lsof does), anything owned by another user, special files,
   nested mounts, and moves that would leave the HDD with less than 1 GB.
@@ -130,6 +142,10 @@ The launcher locates its repository relative to the script. MEM_INSPECTOR_HOME c
   with live output, exit code and scrollback. Nothing is ever run with sudo,
   doas, pkexec, su or run0: commands that need root are shown with "Needs
   root" and a copy button. A rehearsal home only gets home-scoped commands.
+  Commands that would clear a protected folder are not offered and refuse to
+  run; a symlinked `~/.cache/uv` or `~/go/pkg/mod` is resolved first and must
+  lead to a plain folder in home, on home's disk, outside anything protected.
+  Cache roots reached through a symlink are never offered for delete.
 - Never touched: anything outside home (except the archive target and the
   commands above), anything reached through a symlink, `~/.ssh`, `~/.gnupg`,
   keyrings, browser profiles, the `protect` list in settings, `~/.claude*`,
@@ -139,7 +155,7 @@ Overrides for rehearsal and tests (users never need them):
 `MEM_INSPECTOR_SCAN_HOME` and `MEM_INSPECTOR_ARCHIVE`. Build a disposable fake
 home with `python3 scripts/rehearsal-home.py DIR [ARCHIVE]` and launch against
 it. Put DIR on the SSD (for example under /var/tmp) and ARCHIVE on the HDD to
-see real SSD to HDD moves. Never point a rehearsal at real data.
+see real SSD to HDD moves; an ARCHIVE on the home or system disk refuses moves. Never point a rehearsal at real data.
 
 To preview suggestions on a real scan without touching anything:
 `MEM_OVERVIEW_JSON=scan.json cargo test real_home -- --ignored --nocapture`.

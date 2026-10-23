@@ -117,6 +117,22 @@ function CardView({
         <span className="quiet small">No longer applies</span>
       </article>
     );
+  if (card.held)
+    return (
+      <article className="card held" style={style}>
+        <Tile kind={card.kind} />
+        <div className="main">
+          <p
+            className="issue"
+            title={card.paths.map((p) => tilde(p, home)).join("\n")}
+          >
+            {card.issue}
+          </p>
+          <p className="trade">{card.fix}</p>
+        </div>
+        <span className="size tabular">{size(card.bytes)}</span>
+      </article>
+    );
   if (state !== "open") {
     const ok = state === "done" || state === "ran";
     const label =
@@ -348,6 +364,8 @@ function App() {
   const [cleanup, setCleanup] = useState<Slot[] | null>(null);
   const [placement, setPlacement] = useState<Slot[] | null>(null);
   const [keep, setKeep] = useState("");
+  /** Why moves are paused (archive drive unplugged), or null. */
+  const [paused, setPaused] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [busy, setBusy] = useState<Busy>(null);
   const [scan, setScan] = useState<{
@@ -394,6 +412,7 @@ function App() {
     setDisks(d.disks);
     setHome(d.home);
     setArchive(d.archive ?? "");
+    setPaused(d.paused);
     setUndo(d.undo);
     setScannedAt(d.scannedAt ? d.scannedAt * 1000 : null);
     return d.disks;
@@ -435,6 +454,7 @@ function App() {
         const places = api.placement().then((p) => {
           if (token !== run.current) return;
           setKeep(p.keep);
+          setPaused(p.paused);
           setPlacement(p.cards.map((card) => ({ card, state: "open" })));
         });
         const cleans = api.suggest(engine).then((s) => {
@@ -489,10 +509,8 @@ function App() {
       .catch((e) => setNote(errorText(e)));
   }, []);
 
-  /** A new archive folder: move cards are rebuilt for it, if a scan is done. */
-  const archiveSaved = (s: AppSettings) => {
-    setSettings(s);
-    setArchive(s.archive ?? "");
+  /** Move cards rebuilt for the archive as it is now, if a scan is done. */
+  const reloadPlacement = () => {
     if (scan || busy) return;
     const token = run.current;
     setPlacement(null);
@@ -501,6 +519,7 @@ function App() {
       .then((p) => {
         if (token !== run.current) return;
         setKeep(p.keep);
+        setPaused(p.paused);
         setPlacement(p.cards.map((card) => ({ card, state: "open" })));
       })
       .catch((e) => {
@@ -508,6 +527,19 @@ function App() {
         setNote(errorText(e));
       });
   };
+  /** A new archive folder: move cards are rebuilt for it. */
+  const archiveSaved = (s: AppSettings) => {
+    setSettings(s);
+    setArchive(s.archive ?? "");
+    reloadPlacement();
+  };
+  // The archive drive came back: the cards found while it was away are empty.
+  const wasPaused = useRef<string | null>(null);
+  useEffect(() => {
+    if (wasPaused.current && !paused) reloadPlacement();
+    wasPaused.current = paused;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paused]);
   const noClaude = settings?.claude.installed === false;
   const movesOff = settings !== null && !settings.archive;
 
@@ -724,7 +756,9 @@ function App() {
     : 0;
   const hddFree = others.reduce((s, d) => s + d.free, 0);
   const openCleanup = (cleanup ?? []).filter((s) => s.state === "open");
-  const openPlace = (placement ?? []).filter((s) => s.state === "open");
+  const openPlace = (placement ?? []).filter(
+    (s) => s.state === "open" && !s.card.held,
+  );
   const cleanupLeft = openCleanup.reduce((s, x) => s + x.card.bytes, 0);
   const tidy =
     cleanup !== null &&
@@ -732,7 +766,7 @@ function App() {
     openCleanup.length === 0 &&
     openPlace.length === 0;
   const firstOpen = (list: Slot[] | null) =>
-    list?.find((s) => s.state === "open")?.card.id;
+    list?.find((s) => s.state === "open" && !s.card.held)?.card.id;
 
   return (
     <div className={term ? "app with-term" : "app"}>
@@ -848,7 +882,11 @@ function App() {
               </span>
               <div>
                 <b>All tidy</b>
-                <p className="quiet">Nothing big to clean or move right now.</p>
+                <p className="quiet">
+                  {paused
+                    ? "Nothing big to clean right now."
+                    : "Nothing big to clean or move right now."}
+                </p>
               </div>
             </div>
           ) : (
@@ -924,7 +962,11 @@ function App() {
                   BELONGS ON THE HDD
                   <span>Moved with a link back, undoable</span>
                 </div>
-                {placement === null ? (
+                {paused ? (
+                  <p className="hint" title={paused}>
+                    Archive drive not connected - moves paused
+                  </p>
+                ) : placement === null ? (
                   <Skeleton n={2} label="Looking for data that belongs here" />
                 ) : placement.length === 0 ? (
                   <p className="hint">Everything is on the right disk.</p>

@@ -707,7 +707,7 @@ impl Bridge {
         let home = space.home.to_string_lossy().into_owned();
         match r.action {
             Action::Disks => Ok(
-                json!({"disks": self.disk_view()?, "home": home, "archive": space.archive, "undo": self.undo_list()?, "scannedAt": self.scanned_at()?}),
+                json!({"disks": self.disk_view()?, "home": home, "archive": space.archive, "paused": paused(&space), "undo": self.undo_list()?, "scannedAt": self.scanned_at()?}),
             ),
             Action::Progress => {
                 let (done, total) = space::progress();
@@ -721,7 +721,7 @@ impl Bridge {
                     .map(|c| self.register("p", c))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(
-                    json!({"cards": cards, "keep": placement::KEEP_ON_SSD, "archive": space.archive, "home": home}),
+                    json!({"cards": cards, "keep": placement::KEEP_ON_SSD, "archive": space.archive, "paused": paused(&space), "home": home}),
                 )
             }
             Action::Recheck => self.recheck(),
@@ -731,6 +731,7 @@ impl Bridge {
                     .then(|| card.paths.first().and_then(|p| tools::Tool::from_key(p)))
                     .flatten()
                     .ok_or("Only the app's own cleanup commands can run")?;
+                tool.check(&space).map_err(|e| format!("Not run: {e}"))?;
                 let cmd = tool
                     .command(&space.home)
                     .ok_or("This command needs root; run it in your own terminal")?;
@@ -842,6 +843,9 @@ impl Bridge {
             }
             Action::Plan => {
                 let card = self.card(r.id.as_deref())?;
+                if card.held {
+                    return Err(format!("This stays on the SSD: {}", card.fix));
+                }
                 let mut paths = Vec::new();
                 for p in &card.paths {
                     let path = PathBuf::from(p);
@@ -849,8 +853,10 @@ impl Bridge {
                         && space.rel(&path).is_some_and(|rel| {
                             space::CACHE_ROOTS.iter().any(|(c, _)| rel == Path::new(c))
                         });
+                    // Never list a symlinked root's children: they live outside home.
+                    let dir = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir());
                     match std::fs::read_dir(&path) {
-                        Ok(rd) if root => paths.extend(rd.flatten().map(|e| e.path())),
+                        Ok(rd) if root && dir => paths.extend(rd.flatten().map(|e| e.path())),
                         _ => paths.push(path),
                     }
                 }
@@ -858,10 +864,11 @@ impl Bridge {
                     vec![json!({"path": card.paths[0], "bytes": card.bytes})]
                 } else {
                     let sizes = space::freeable_each(&paths);
+                    let open = space::OpenFiles::scan();
                     let mut rows: Vec<(PathBuf, u64)> = paths.into_iter().zip(sizes).collect();
                     rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
                     rows.into_iter()
-                        .map(|(p, b)| json!({"path": p, "bytes": b, "ok": space.guard(card.action, &p).is_ok()}))
+                        .map(|(p, b)| json!({"path": p, "bytes": b, "ok": space.guard_with(card.action, &p, &open).is_ok()}))
                         .collect()
                 };
                 Ok(
@@ -870,6 +877,9 @@ impl Bridge {
             }
             Action::Run => {
                 let card = self.card(r.id.as_deref())?;
+                if card.held {
+                    return Err(format!("This stays on the SSD: {}", card.fix));
+                }
                 let paths: Vec<PathBuf> = r
                     .paths
                     .unwrap_or_default()
@@ -945,7 +955,7 @@ impl Bridge {
                 match c.paths.first().and_then(|p| tools::Tool::from_key(p)) {
                     Some(t) => {
                         let bytes = t.probe(&space.home);
-                        if bytes < 1 << 20 {
+                        if bytes < 1 << 20 || !t.allowed(&space) {
                             gone.push(c.id);
                         } else {
                             c.bytes = bytes;
@@ -961,7 +971,11 @@ impl Bridge {
                 Action2::Delete => paths
                     .iter()
                     .zip(space::freeable_each(&paths))
-                    .map(|(p, b)| space.guard(Action2::Delete, p).ok().map(|_| b))
+                    // Files in use stay on the card: still there, cleared when the app quits.
+                    .map(|(p, b)| {
+                        let idle = space::OpenFiles::default();
+                        space.guard_with(Action2::Delete, p, &idle).ok().map(|_| b)
+                    })
                     .collect(),
                 _ => paths.iter().map(|p| placement::live_bytes(p)).collect(),
             };
@@ -1025,6 +1039,13 @@ impl Bridge {
 const KINDS: [&str; 8] = [
     "video", "images", "code", "deps", "caches", "models", "archives", "other",
 ];
+
+/// Why moves are paused although an archive folder is set: its drive is
+/// unplugged or not mounted. None when moves work or are off.
+fn paused(space: &Space) -> Option<String> {
+    space.archive.as_ref()?;
+    space.archive_ready().err()
+}
 
 fn kinds_pending(is_home: bool, complete: bool, running: bool, known: bool) -> bool {
     if is_home {
@@ -1445,7 +1466,7 @@ mod tests {
     fn recheck_drops_finished_paths_and_cards_without_rescan() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
-        let space = Space::new(home.clone(), Some(dir.path().join("archive"))).unwrap();
+        let space = Space::same_disk(home.clone(), dir.path().join("archive"));
         let b = Bridge::with_space(None, Some(space.clone()));
         let a = home.join("Videos/a.mp4");
         let v = home.join("Videos/b.mp4");
@@ -1472,6 +1493,7 @@ mod tests {
             group,
             target: None,
             tradeoff: None,
+            held: false,
         };
         let moved = b
             .register(
@@ -1495,10 +1517,114 @@ mod tests {
         assert_eq!(lock(&b.inner.cards).unwrap().len(), 1);
     }
     #[test]
+    fn unplugged_archive_drive_pauses_moves_out_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let archive = dir.path().join("archive");
+        let space = Space::same_disk(home.clone(), archive.clone());
+        std::fs::create_dir_all(&home).unwrap();
+        let b = Bridge::with_space(None, Some(space));
+        let disks = || b.request(req(json!({"action":"disks"}))).unwrap();
+        assert_eq!(disks()["paused"], Value::Null);
+        // The drive goes away: its folder is gone, the setting stays.
+        std::fs::remove_dir(&archive).unwrap();
+        let d = disks();
+        assert_eq!(d["archive"], archive.to_string_lossy().as_ref());
+        assert!(d["paused"].as_str().unwrap().contains("plugged in"), "{d}");
+    }
+    #[test]
+    fn plan_never_lists_a_symlinked_cache_root_out_of_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let space = Space::same_disk(home.clone(), dir.path().join("archive"));
+        let outside = dir.path().join("elsewhere/cache");
+        std::fs::create_dir_all(outside.join("app")).unwrap();
+        std::fs::write(outside.join("app/blob"), vec![1u8; 2 << 20]).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(&outside, home.join(".cache")).unwrap();
+        let b = Bridge::with_space(None, Some(space));
+        let root = home.join(".cache").to_string_lossy().into_owned();
+        let card = b
+            .register(
+                "s",
+                Suggestion {
+                    id: String::new(),
+                    issue: "x".into(),
+                    fix: "y".into(),
+                    action: Action2::Delete,
+                    paths: vec![root.clone()],
+                    bytes: 1,
+                    command: None,
+                    kind: "caches".into(),
+                    root: false,
+                    group: None,
+                    target: None,
+                    tradeoff: None,
+                    held: false,
+                },
+            )
+            .unwrap();
+        let r = b
+            .request(req(json!({"action":"plan","id":card.id})))
+            .unwrap();
+        assert_eq!(
+            r["plan"]["rows"],
+            json!([{"path": root, "bytes": 0, "ok": false}])
+        );
+        let child = home.join(".cache/app").to_string_lossy().into_owned();
+        let run = b.request(req(json!({"action":"run","id":card.id,"paths":[child]})));
+        assert!(
+            run.is_err()
+                || !run.unwrap()["outcome"]["failed"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+        );
+        assert!(outside.join("app/blob").exists());
+    }
+    #[test]
+    fn held_cards_never_plan_or_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let space = Space::same_disk(home.clone(), dir.path().join("archive"));
+        let b = Bridge::with_space(None, Some(space));
+        let disk = home.join("VMs/old.qcow2");
+        std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
+        std::fs::write(&disk, vec![1u8; 2 << 20]).unwrap();
+        let path = disk.to_string_lossy().into_owned();
+        let card = b
+            .register(
+                "p",
+                Suggestion {
+                    id: String::new(),
+                    issue: "VM disk stays on the SSD".into(),
+                    fix: "In use by a running VM".into(),
+                    action: Action2::Move,
+                    paths: vec![path.clone()],
+                    bytes: 2 << 20,
+                    command: None,
+                    kind: "archives".into(),
+                    root: false,
+                    group: None,
+                    target: None,
+                    tradeoff: None,
+                    held: true,
+                },
+            )
+            .unwrap();
+        for r in [
+            json!({"action":"plan","id":card.id}),
+            json!({"action":"run","id":card.id,"paths":[path]}),
+        ] {
+            assert!(b.request(req(r)).unwrap_err().contains("stays on the SSD"));
+        }
+        assert!(std::fs::symlink_metadata(&disk).unwrap().is_file());
+    }
+    #[test]
     fn exec_runs_only_app_commands_after_confirm_and_never_root() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
-        let space = Space::new(home.clone(), Some(dir.path().join("archive"))).unwrap();
+        let space = Space::same_disk(home.clone(), dir.path().join("archive"));
         let b = Bridge::with_space(None, Some(space));
         let uv = home.join(".cache/uv/wheels-v5/blob");
         std::fs::create_dir_all(uv.parent().unwrap()).unwrap();
@@ -1516,6 +1642,7 @@ mod tests {
             group: None,
             target: None,
             tradeoff: None,
+            held: false,
         };
         let root = b
             .register("s", card("system:pacman", Action2::Command))
@@ -1567,6 +1694,48 @@ mod tests {
             .unwrap()
             .iter()
             .any(|g| g == ok.id.as_str()));
+    }
+    #[test]
+    fn exec_refuses_commands_that_reach_a_protected_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let mut space = Space::same_disk(home.clone(), dir.path().join("archive"));
+        let uv = home.join(".cache/uv/wheels-v5/blob");
+        std::fs::create_dir_all(uv.parent().unwrap()).unwrap();
+        std::fs::write(&uv, vec![1u8; 2 << 20]).unwrap();
+        for protect in [".cache/uv", ".cache", ".cache/uv/wheels-v5"] {
+            space.protect = vec![protect.into()];
+            let b = Bridge::with_space(None, Some(space.clone()));
+            let card = b
+                .register(
+                    "s",
+                    Suggestion {
+                        id: String::new(),
+                        issue: "x".into(),
+                        fix: "y".into(),
+                        action: Action2::Command,
+                        paths: vec!["system:uv".into()],
+                        bytes: 1,
+                        command: Some("shown".into()),
+                        kind: "caches".into(),
+                        root: false,
+                        group: None,
+                        target: None,
+                        tradeoff: None,
+                        held: false,
+                    },
+                )
+                .unwrap();
+            let err = b
+                .request(req(json!({"action":"exec","id":card.id,"confirmed":true})))
+                .unwrap_err();
+            assert!(err.contains("protected"), "{protect}: {err}");
+            assert!(!tools::Tool::Uv.allowed(&space));
+        }
+        assert!(uv.exists());
+        space.protect = vec!["go".into()];
+        assert!(!tools::Tool::GoMod.allowed(&space));
+        assert!(tools::Tool::Uv.allowed(&space) && tools::Tool::Pacman.allowed(&space));
     }
     #[test]
     fn wire_preserves_full_width_integers() {

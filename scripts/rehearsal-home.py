@@ -73,6 +73,8 @@ blob("models/llama-3-8b.Q4.gguf", 520, old)
 blob("Downloads/installer-bundle/setup.run", 60)
 blob("Downloads/installer-bundle/readme.txt", 0)
 age_tree("Downloads/installer-bundle", now - 60 * 86400)
+# A VM disk a guest wrote today: shown on a "stays on the SSD" card, never moved.
+blob("VMs/dev-box.qcow2", 120)
 project = os.path.join(home, "code/old-game")
 blob("code/old-game/assets/textures.pak", 230)
 blob("code/old-game/src/main.rs", 0)
@@ -83,4 +85,7 @@ age_tree("code/old-game", now - 100 * 86400)
 blob(".ssh/id_ed25519", 0)
 blob(".config/app/huge-clip.mp4", 110, old)
 os.makedirs(archive, exist_ok=True)
+if os.stat(archive).st_dev in (os.stat(home).st_dev, os.stat("/").st_dev):
+    print(f"note: {archive} is on the home or system disk, so moves will be refused;"
+          " pass an ARCHIVE on another mounted disk to rehearse them", file=sys.stderr)
 print(f"MEM_INSPECTOR_SCAN_HOME={home} MEM_INSPECTOR_ARCHIVE={archive}")
